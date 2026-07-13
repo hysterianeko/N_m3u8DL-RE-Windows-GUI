@@ -1,0 +1,28 @@
+# Build output
+build/
+bin/
+obj/
+dist/
+tools/
+*.exe
+*.dll
+*.pdb
+
+# IDE and local workspace
+.idea/
+.vs/
+*.suo
+*.user
+*.userprefs
+
+# Runtime and sensitive local files
+settings.xml
+*.key
+*.iv
+*.tmp
+*.log
+
+# OS metadata
+Thumbs.db
+Desktop.ini
+.DS_Store

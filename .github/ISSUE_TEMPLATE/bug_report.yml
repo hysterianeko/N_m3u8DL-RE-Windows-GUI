@@ -1,0 +1,46 @@
+name: Bug report
+description: Report a reproducible problem without including private URLs, cookies, tokens, or keys.
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Remove query tokens, cookies, authorization headers, and encryption keys before posting logs.
+  - type: input
+    id: version
+    attributes:
+      label: Application version
+      placeholder: "1.2.0"
+    validations:
+      required: true
+  - type: dropdown
+    id: input_type
+    attributes:
+      label: Input type
+      options:
+        - Online M3U8
+        - Online MPD
+        - Imported playlist text
+        - Local playlist file
+        - Existing media conversion
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Use an example.com URL or redact the host and query string.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected result
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted log
+      render: text
