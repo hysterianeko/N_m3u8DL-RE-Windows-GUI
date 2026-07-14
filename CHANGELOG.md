@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented here.
 
+## 1.2.2 - 2026-07-14
+
+### Fixed
+
+- Decode redirected `N_m3u8DL-RE` output with the Windows default code page while keeping FFmpeg output on UTF-8.
+- Give each download an owned `--tmp-dir` and remove its fragments after completion, failure, or cancellation without guessing paths in the user's save directory.
+- Preserve temporary files and the running state when an external process cannot be confirmed stopped.
+- Gray out the unavailable key and file-conversion actions while a task is running, then restore their normal or configured-key appearance afterward.
+
 ## 1.2.1 - 2026-07-14
 
 ### Fixed

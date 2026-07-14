@@ -118,7 +118,33 @@ namespace M3u8DownloaderGui
             }
             AssertTrue(!File.Exists(temporarySecret), "temporary key file is deleted");
 
+            AssertTrue(
+                ExternalToolOutputEncodings.Downloader.CodePage == System.Text.Encoding.Default.CodePage,
+                "downloader output uses the Windows default code page");
+            AssertTrue(
+                ExternalToolOutputEncodings.Ffmpeg.CodePage == System.Text.Encoding.UTF8.CodePage,
+                "FFmpeg output remains UTF-8");
+            System.Diagnostics.ProcessStartInfo downloaderStartInfo =
+                new System.Diagnostics.ProcessStartInfo();
+            ExternalToolOutputEncodings.ApplyDownloader(downloaderStartInfo);
+            AssertTrue(
+                downloaderStartInfo.StandardOutputEncoding.CodePage ==
+                    System.Text.Encoding.Default.CodePage &&
+                downloaderStartInfo.StandardErrorEncoding.CodePage ==
+                    System.Text.Encoding.Default.CodePage,
+                "downloader stdout and stderr both use the Windows default code page");
+            System.Diagnostics.ProcessStartInfo ffmpegStartInfo =
+                new System.Diagnostics.ProcessStartInfo();
+            ExternalToolOutputEncodings.ApplyFfmpeg(ffmpegStartInfo);
+            AssertTrue(
+                ffmpegStartInfo.StandardOutputEncoding.CodePage ==
+                    System.Text.Encoding.UTF8.CodePage &&
+                ffmpegStartInfo.StandardErrorEncoding.CodePage ==
+                    System.Text.Encoding.UTF8.CodePage,
+                "FFmpeg stdout and stderr both use UTF-8");
+
             TestToolLocator();
+            TestDownloadTemporaryStore();
             TestConversionFileStore();
 
             Console.WriteLine(_failed == 0 ? "ALL TESTS PASSED" : (_failed + " TEST(S) FAILED"));
@@ -165,6 +191,56 @@ namespace M3u8DownloaderGui
                 try
                 {
                     Directory.Delete(directory, true);
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        private static void TestDownloadTemporaryStore()
+        {
+            string ownedDirectory = null;
+            string unownedDirectory = null;
+            string managedRoot = null;
+
+            try
+            {
+                ownedDirectory = DownloadTemporaryStore.Create();
+                managedRoot = Directory.GetParent(ownedDirectory).FullName;
+                string nested = Path.Combine(ownedDirectory, "video", "segments");
+                Directory.CreateDirectory(nested);
+                File.WriteAllBytes(Path.Combine(nested, "000.ts.tmp"), new byte[] { 1, 2, 3 });
+                AssertTrue(
+                    DownloadTemporaryStore.Delete(ownedDirectory) && !Directory.Exists(ownedDirectory),
+                    "owned download temporary directory is deleted recursively");
+                ownedDirectory = null;
+
+                unownedDirectory = Path.Combine(
+                    managedRoot,
+                    "download_" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(unownedDirectory);
+                File.WriteAllText(Path.Combine(unownedDirectory, "user-file.txt"), "keep");
+                AssertTrue(
+                    !DownloadTemporaryStore.Delete(unownedDirectory) && Directory.Exists(unownedDirectory),
+                    "download temporary cleanup rejects a directory without an ownership marker");
+            }
+            finally
+            {
+                DownloadTemporaryStore.Delete(ownedDirectory);
+                try
+                {
+                    if (!string.IsNullOrWhiteSpace(unownedDirectory) && Directory.Exists(unownedDirectory))
+                    {
+                        Directory.Delete(unownedDirectory, true);
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(managedRoot) &&
+                        Directory.Exists(managedRoot) &&
+                        Directory.GetFileSystemEntries(managedRoot).Length == 0)
+                    {
+                        Directory.Delete(managedRoot, false);
+                    }
                 }
                 catch
                 {

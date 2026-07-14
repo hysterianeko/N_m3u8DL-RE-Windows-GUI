@@ -158,6 +158,40 @@ namespace M3u8DownloaderGui
         }
     }
 
+    internal static class ExternalToolOutputEncodings
+    {
+        public static Encoding Downloader
+        {
+            get { return Encoding.Default; }
+        }
+
+        public static Encoding Ffmpeg
+        {
+            get { return Encoding.UTF8; }
+        }
+
+        public static void ApplyDownloader(ProcessStartInfo startInfo)
+        {
+            Apply(startInfo, Downloader);
+        }
+
+        public static void ApplyFfmpeg(ProcessStartInfo startInfo)
+        {
+            Apply(startInfo, Ffmpeg);
+        }
+
+        private static void Apply(ProcessStartInfo startInfo, Encoding encoding)
+        {
+            if (startInfo == null)
+            {
+                throw new ArgumentNullException("startInfo");
+            }
+
+            startInfo.StandardOutputEncoding = encoding;
+            startInfo.StandardErrorEncoding = encoding;
+        }
+    }
+
     internal static class ToolLocator
     {
         private static readonly string WinGetFfmpegLink = Path.Combine(
@@ -1163,6 +1197,187 @@ namespace M3u8DownloaderGui
                     Directory.GetFileSystemEntries(SecretDirectory).Length == 0)
                 {
                     Directory.Delete(SecretDirectory, false);
+                }
+            }
+            catch
+            {
+            }
+        }
+    }
+
+    internal static class DownloadTemporaryStore
+    {
+        private const string DirectoryPrefix = "download_";
+        private const string OwnerMarkerName = ".m3u8-gui-owner";
+        private const string OwnerMarkerPrefix = "M3u8DownloaderGui:v1:";
+
+        private static readonly string RootDirectory = Path.Combine(
+            Path.GetTempPath(),
+            @"N_m3u8DL-RE-GUI\Downloads");
+
+        public static string Create()
+        {
+            Directory.CreateDirectory(RootDirectory);
+            string taskId = Guid.NewGuid().ToString("N");
+            string path = Path.Combine(
+                RootDirectory,
+                DirectoryPrefix + taskId);
+            Directory.CreateDirectory(path);
+            try
+            {
+                using (FileStream stream = new FileStream(
+                    Path.Combine(path, OwnerMarkerName),
+                    FileMode.CreateNew,
+                    FileAccess.Write,
+                    FileShare.None))
+                using (StreamWriter writer = new StreamWriter(stream, new UTF8Encoding(false)))
+                {
+                    writer.Write(OwnerMarkerPrefix + taskId);
+                }
+
+                return path;
+            }
+            catch
+            {
+                try
+                {
+                    if (Directory.Exists(path))
+                    {
+                        Directory.Delete(path, true);
+                    }
+
+                    TryDeleteRootIfEmpty();
+                }
+                catch
+                {
+                }
+
+                throw;
+            }
+        }
+
+        public static bool Delete(string path)
+        {
+            string fullPath;
+            if (!TryGetOwnedPath(path, out fullPath))
+            {
+                return false;
+            }
+
+            for (int attempt = 0; attempt < 12; attempt++)
+            {
+                try
+                {
+                    if (Directory.Exists(fullPath))
+                    {
+                        FileAttributes rootAttributes = File.GetAttributes(fullPath);
+                        if ((rootAttributes & FileAttributes.ReparsePoint) != 0 ||
+                            !HasValidOwnerMarker(fullPath))
+                        {
+                            return false;
+                        }
+
+                        DeleteDirectoryTree(fullPath);
+                    }
+
+                    TryDeleteRootIfEmpty();
+                    return !Directory.Exists(fullPath);
+                }
+                catch
+                {
+                    if (attempt < 11)
+                    {
+                        Thread.Sleep(150);
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private static bool TryGetOwnedPath(string path, out string fullPath)
+        {
+            fullPath = null;
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                return false;
+            }
+
+            try
+            {
+                string root = Path.GetFullPath(RootDirectory).TrimEnd(Path.DirectorySeparatorChar);
+                string candidate = Path.GetFullPath(path).TrimEnd(Path.DirectorySeparatorChar);
+                DirectoryInfo parent = Directory.GetParent(candidate);
+                string name = Path.GetFileName(candidate);
+                Guid taskId;
+                if (parent == null ||
+                    !string.Equals(parent.FullName, root, StringComparison.OrdinalIgnoreCase) ||
+                    name.Length != DirectoryPrefix.Length + 32 ||
+                    !name.StartsWith(DirectoryPrefix, StringComparison.OrdinalIgnoreCase) ||
+                    !Guid.TryParseExact(name.Substring(DirectoryPrefix.Length), "N", out taskId))
+                {
+                    return false;
+                }
+
+                fullPath = candidate;
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static bool HasValidOwnerMarker(string directory)
+        {
+            try
+            {
+                string name = Path.GetFileName(directory.TrimEnd(Path.DirectorySeparatorChar));
+                string taskId = name.Substring(DirectoryPrefix.Length);
+                string marker = File.ReadAllText(
+                    Path.Combine(directory, OwnerMarkerName),
+                    Encoding.UTF8).Trim();
+                return string.Equals(
+                    marker,
+                    OwnerMarkerPrefix + taskId,
+                    StringComparison.Ordinal);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void DeleteDirectoryTree(string directory)
+        {
+            FileAttributes attributes = File.GetAttributes(directory);
+            if ((attributes & FileAttributes.ReparsePoint) != 0)
+            {
+                Directory.Delete(directory, false);
+                return;
+            }
+
+            foreach (string file in Directory.GetFiles(directory, "*", SearchOption.TopDirectoryOnly))
+            {
+                File.Delete(file);
+            }
+
+            foreach (string child in Directory.GetDirectories(directory, "*", SearchOption.TopDirectoryOnly))
+            {
+                DeleteDirectoryTree(child);
+            }
+
+            Directory.Delete(directory, false);
+        }
+
+        private static void TryDeleteRootIfEmpty()
+        {
+            try
+            {
+                if (Directory.Exists(RootDirectory) &&
+                    Directory.GetFileSystemEntries(RootDirectory).Length == 0)
+                {
+                    Directory.Delete(RootDirectory, false);
                 }
             }
             catch

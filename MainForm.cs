@@ -22,6 +22,9 @@ namespace M3u8DownloaderGui
         private static readonly Color DangerColor = Color.FromArgb(183, 55, 53);
         private static readonly Color InvalidColor = Color.FromArgb(255, 238, 236);
         private static readonly Color ValidColor = Color.White;
+        private static readonly Color DisabledControlColor = Color.FromArgb(231, 235, 237);
+        private static readonly Color DisabledTextColor = Color.FromArgb(132, 142, 149);
+        private static readonly Color DisabledBorderColor = Color.FromArgb(203, 210, 214);
 
         private readonly ToolTip _toolTip;
         private readonly UserSettings _settings;
@@ -70,6 +73,7 @@ namespace M3u8DownloaderGui
         private string _manualHlsIv = string.Empty;
         private string _temporaryHlsKeyPath;
         private string _temporaryHlsIvPath;
+        private string _downloadTemporaryDirectory;
         private readonly List<string> _secretRedactionValues = new List<string>();
         private OperationKind _activeOperation;
         private string _activeOperationDirectory;
@@ -127,7 +131,54 @@ namespace M3u8DownloaderGui
                 _startButton.Width >= 120 &&
                 _logTextBox.Height > 80;
 
-            return controlsExist && namingWorks && layoutIsStable;
+            SetRunningState(true);
+            bool runningStateIsClear =
+                !_keyOptionsButton.Enabled &&
+                !_convertFileButton.Enabled &&
+                _keyOptionsButton.BackColor == DisabledControlColor &&
+                _convertFileButton.BackColor == DisabledControlColor &&
+                _keyOptionsButton.ForeColor == DisabledTextColor &&
+                _convertFileButton.ForeColor == DisabledTextColor &&
+                _keyOptionsButton.FlatAppearance.BorderColor == DisabledBorderColor &&
+                _convertFileButton.FlatAppearance.BorderColor == DisabledBorderColor &&
+                _keyOptionsButton.Cursor == Cursors.Default &&
+                _convertFileButton.Cursor == Cursors.Default;
+            SetRunningState(false);
+            bool idleStateIsRestored =
+                _keyOptionsButton.Enabled &&
+                _convertFileButton.Enabled &&
+                _keyOptionsButton.BackColor == SurfaceColor &&
+                _convertFileButton.BackColor == SurfaceColor &&
+                _keyOptionsButton.ForeColor == TextColor &&
+                _convertFileButton.ForeColor == TextColor &&
+                _keyOptionsButton.FlatAppearance.BorderColor == BorderColor &&
+                _convertFileButton.FlatAppearance.BorderColor == BorderColor &&
+                _keyOptionsButton.Cursor == Cursors.Hand &&
+                _convertFileButton.Cursor == Cursors.Hand;
+
+            _manualHlsKey = "00112233445566778899aabbccddeeff";
+            UpdateKeyState();
+            SetRunningState(true);
+            bool configuredKeyIsDisabledClearly =
+                !_keyOptionsButton.Enabled &&
+                _keyOptionsButton.BackColor == DisabledControlColor;
+            SetRunningState(false);
+            bool configuredKeyStyleIsRestored =
+                _keyOptionsButton.Enabled &&
+                _keyOptionsButton.ForeColor == AccentColor &&
+                _keyOptionsButton.FlatAppearance.BorderColor == AccentColor;
+            _manualHlsKey = string.Empty;
+            UpdateKeyState();
+            bool clearedKeyStyleIsRestored =
+                _keyOptionsButton.Text == "密钥..." &&
+                _keyOptionsButton.ForeColor == TextColor &&
+                _keyOptionsButton.FlatAppearance.BorderColor == BorderColor &&
+                _startButton.Text == "开始下载";
+
+            return controlsExist && namingWorks && layoutIsStable &&
+                   runningStateIsClear && idleStateIsRestored &&
+                   configuredKeyIsDisabledClearly && configuredKeyStyleIsRestored &&
+                   clearedKeyStyleIsRestored;
         }
 
         private void InitializeForm()
@@ -942,8 +993,7 @@ namespace M3u8DownloaderGui
         {
             bool hasKey = !string.IsNullOrWhiteSpace(_manualHlsKey);
             _keyOptionsButton.Text = hasKey ? "密钥已设置" : "密钥...";
-            _keyOptionsButton.ForeColor = hasKey ? AccentColor : TextColor;
-            _keyOptionsButton.FlatAppearance.BorderColor = hasKey ? AccentColor : BorderColor;
+            SetSecondaryButtonEnabled(_keyOptionsButton, _keyOptionsButton.Enabled);
             _startButton.Text = hasKey ? "使用密钥下载" : "开始下载";
             _toolTip.SetToolTip(
                 _keyOptionsButton,
@@ -1083,8 +1133,7 @@ namespace M3u8DownloaderGui
             startInfo.WindowStyle = ProcessWindowStyle.Hidden;
             startInfo.RedirectStandardOutput = true;
             startInfo.RedirectStandardError = true;
-            startInfo.StandardOutputEncoding = Encoding.UTF8;
-            startInfo.StandardErrorEncoding = Encoding.UTF8;
+            ExternalToolOutputEncodings.ApplyFfmpeg(startInfo);
 
             Process process = new Process();
             process.StartInfo = startInfo;
@@ -1138,9 +1187,16 @@ namespace M3u8DownloaderGui
             catch (Exception exception)
             {
                 AppendLog("[GUI] FFmpeg 启动失败：" + exception.Message);
-                if (processStarted)
+                bool processStopped = !processStarted || StopProcessForCleanup(process, 5000);
+                if (!processStopped)
                 {
-                    StopProcessForCleanup(process, 5000);
+                    _isCancelling = true;
+                    _statusLabel.Text = "FFmpeg 启动异常，正在等待进程退出";
+                    AppendLog("[GUI] 无法确认 FFmpeg 已退出；保留临时文件并维持取消状态。");
+                    ShowError(
+                        "FFmpeg 启动后发生异常，并且暂时无法确认进程已经退出。\r\n\r\n" +
+                        "请再次点击“取消”，或关闭窗口以重试终止进程。");
+                    return;
                 }
 
                 _activeProcess = null;
@@ -1323,12 +1379,32 @@ namespace M3u8DownloaderGui
                 return;
             }
 
+            if (!DeleteDownloadTemporaryDirectory())
+            {
+                DeleteTemporarySecrets();
+                ShowError("上一次下载的临时目录仍被占用，请稍后重试或关闭占用该目录的程序。");
+                return;
+            }
+
+            try
+            {
+                _downloadTemporaryDirectory = DownloadTemporaryStore.Create();
+            }
+            catch (Exception exception)
+            {
+                DeleteTemporarySecrets();
+                ShowError("无法创建下载临时目录：\r\n\r\n" + exception.Message);
+                return;
+            }
+
             List<string> arguments = new List<string>();
             arguments.Add(request.Input);
             arguments.Add("--save-dir");
             arguments.Add(request.SaveDirectory);
             arguments.Add("--save-name");
             arguments.Add(request.FileName);
+            arguments.Add("--tmp-dir");
+            arguments.Add(_downloadTemporaryDirectory);
             arguments.Add("--auto-select");
             arguments.Add("--ffmpeg-binary-path");
             arguments.Add(request.FfmpegPath);
@@ -1366,8 +1442,7 @@ namespace M3u8DownloaderGui
             startInfo.WindowStyle = ProcessWindowStyle.Hidden;
             startInfo.RedirectStandardOutput = true;
             startInfo.RedirectStandardError = true;
-            startInfo.StandardOutputEncoding = Encoding.UTF8;
-            startInfo.StandardErrorEncoding = Encoding.UTF8;
+            ExternalToolOutputEncodings.ApplyDownloader(startInfo);
 
             string ffmpegDirectory = Path.GetDirectoryName(request.FfmpegPath);
             if (!string.IsNullOrWhiteSpace(ffmpegDirectory))
@@ -1428,9 +1503,16 @@ namespace M3u8DownloaderGui
             catch (Exception exception)
             {
                 AppendLog("[GUI] 启动失败：" + exception.Message);
-                if (processStarted)
+                bool processStopped = !processStarted || StopProcessForCleanup(process, 5000);
+                if (!processStopped)
                 {
-                    StopProcessForCleanup(process, 5000);
+                    _isCancelling = true;
+                    _statusLabel.Text = "下载程序启动异常，正在等待进程退出";
+                    AppendLog("[GUI] 无法确认下载进程已退出；保留临时文件并维持取消状态。");
+                    ShowError(
+                        "下载程序启动后发生异常，并且暂时无法确认进程已经退出。\r\n\r\n" +
+                        "请再次点击“取消”，或关闭窗口以重试终止进程。");
+                    return;
                 }
 
                 _activeProcess = null;
@@ -1449,6 +1531,10 @@ namespace M3u8DownloaderGui
 
                 SetRunningState(false);
                 _statusLabel.Text = "启动失败";
+                if (!DeleteDownloadTemporaryDirectory())
+                {
+                    AppendLog("[GUI] 警告：下载临时目录仍被占用，将在下次任务时重试清理。");
+                }
                 DeleteImportedPlaylist();
                 DeleteTemporarySecrets();
                 ShowError("无法启动下载程序：\r\n\r\n" + exception.Message);
@@ -1668,6 +1754,10 @@ namespace M3u8DownloaderGui
             else
             {
                 output = FindChangedOutput(saveDirectory);
+                if (!DeleteDownloadTemporaryDirectory())
+                {
+                    AppendLog("[GUI] 警告：下载临时目录仍被占用，将在下次任务时重试清理。");
+                }
             }
 
             _lastOutputPath = output;
@@ -2057,7 +2147,7 @@ namespace M3u8DownloaderGui
             }
             catch
             {
-                return true;
+                return false;
             }
         }
 
@@ -2076,8 +2166,8 @@ namespace M3u8DownloaderGui
             _detectToolsButton.Enabled = !isRunning;
             _muxToMp4CheckBox.Enabled = !isRunning;
             _openFolderWhenDoneCheckBox.Enabled = !isRunning;
-            _keyOptionsButton.Enabled = !isRunning;
-            _convertFileButton.Enabled = !isRunning;
+            SetSecondaryButtonEnabled(_keyOptionsButton, !isRunning);
+            SetSecondaryButtonEnabled(_convertFileButton, !isRunning);
             _startButton.Enabled = !isRunning;
             _cancelButton.Enabled = isRunning;
 
@@ -2091,6 +2181,22 @@ namespace M3u8DownloaderGui
                 _progressBar.MarqueeAnimationSpeed = 0;
                 _progressBar.Style = ProgressBarStyle.Blocks;
             }
+        }
+
+        private void SetSecondaryButtonEnabled(Button button, bool enabled)
+        {
+            bool emphasizeKey =
+                ReferenceEquals(button, _keyOptionsButton) &&
+                !string.IsNullOrWhiteSpace(_manualHlsKey);
+            button.Enabled = enabled;
+            button.BackColor = enabled ? SurfaceColor : DisabledControlColor;
+            button.ForeColor = enabled
+                ? (emphasizeKey ? AccentColor : TextColor)
+                : DisabledTextColor;
+            button.FlatAppearance.BorderColor = enabled
+                ? (emphasizeKey ? AccentColor : BorderColor)
+                : DisabledBorderColor;
+            button.Cursor = enabled ? Cursors.Hand : Cursors.Default;
         }
 
         private void OpenSaveDirectory()
@@ -2201,8 +2307,26 @@ namespace M3u8DownloaderGui
 
             DeleteImportedPlaylist();
             DeleteTemporarySecrets();
+            DeleteDownloadTemporaryDirectory();
             DeleteConversionTemporaryOutput();
             SaveCurrentSettings();
+        }
+
+        private bool DeleteDownloadTemporaryDirectory()
+        {
+            string path = _downloadTemporaryDirectory;
+            if (string.IsNullOrWhiteSpace(path))
+            {
+                return true;
+            }
+
+            if (DownloadTemporaryStore.Delete(path))
+            {
+                _downloadTemporaryDirectory = null;
+                return true;
+            }
+
+            return false;
         }
 
         private void SaveCurrentSettings()

@@ -47,7 +47,7 @@ https://media.example.com/series/episode-01/index.m3u8?token=REDACTED
 --auto-select --ffmpeg-binary-path <ffmpeg.exe> -M format=mp4
 ```
 
-任务运行时会锁定输入控件。点击“取消”会终止下载器及其 FFmpeg 子进程。
+任务运行时会锁定输入控件，“密钥...”和“转换文件...”会变成灰色且不可点击。点击“取消”会终止下载器及其 FFmpeg 子进程，并清理该任务独占临时目录中的下载分片。任务结束后控件会恢复。
 
 ## 3. 猫抓 Blob 播放列表
 

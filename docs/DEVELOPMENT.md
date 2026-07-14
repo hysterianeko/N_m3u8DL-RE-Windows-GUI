@@ -84,6 +84,8 @@ Current self-tests cover:
 - Blob detection and HLS/MPD playlist text recognition.
 - Relative segment, key, map, media, scheme-relative, and MPD BaseURL detection.
 - AES-128 HEX/Base64 parsing and protected temporary file lifecycle.
+- Downloader/FFmpeg output encoding selection and owned download temporary-directory cleanup.
+- Disabled operation-button appearance while an external process is active.
 - Settings/tool defaults through GUI smoke initialization.
 
 The GitHub Actions workflow builds and smoke-tests the application on `windows-latest` and uploads the EXE as a workflow artifact.
@@ -91,7 +93,7 @@ The GitHub Actions workflow builds and smoke-tests the application on `windows-l
 ## Package
 
 ```powershell
-.\package.ps1 -Version 1.2.1
+.\package.ps1 -Version 1.2.2
 ```
 
 This creates a standalone GUI EXE, a lightweight Windows ZIP, and `SHA256SUMS.txt` under `dist`. The ZIP intentionally does not redistribute N_m3u8DL-RE or FFmpeg binaries. It contains the verified dependency setup script and third-party notices instead.
