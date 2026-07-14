@@ -118,10 +118,58 @@ namespace M3u8DownloaderGui
             }
             AssertTrue(!File.Exists(temporarySecret), "temporary key file is deleted");
 
+            TestToolLocator();
             TestConversionFileStore();
 
             Console.WriteLine(_failed == 0 ? "ALL TESTS PASSED" : (_failed + " TEST(S) FAILED"));
             return _failed == 0 ? 0 : 1;
+        }
+
+        private static void TestToolLocator()
+        {
+            string directory = Path.Combine(
+                Path.GetTempPath(),
+                "M3u8DownloaderGuiToolTests_" + Guid.NewGuid().ToString("N"));
+            string originalTestRoot = Environment.GetEnvironmentVariable("M3U8_GUI_TEST_ROOT");
+
+            try
+            {
+                string fakeDriveRoot = Path.Combine(directory, "FakeE");
+                string downloads = Path.Combine(fakeDriveRoot, "Downloads");
+                Directory.CreateDirectory(downloads);
+                string downloader = Path.Combine(downloads, "N_m3u8DL-RE.exe");
+                File.WriteAllBytes(downloader, new byte[] { 1 });
+
+                List<string> commonDirectories = ToolLocator.BuildCommonToolDirectories(
+                    null,
+                    null,
+                    null,
+                    new[] { fakeDriveRoot });
+                AssertContainsPath(
+                    commonDirectories,
+                    downloads,
+                    "tool locator includes Downloads on another fixed drive");
+
+                Environment.SetEnvironmentVariable("M3U8_GUI_TEST_ROOT", downloads);
+                string found = ToolLocator.FindInPathValues(
+                    "N_m3u8DL-RE.exe",
+                    "\"%M3U8_GUI_TEST_ROOT%\"");
+                AssertPathEqual(
+                    downloader,
+                    found,
+                    "tool PATH values expand environment variables and outer quotes");
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("M3U8_GUI_TEST_ROOT", originalTestRoot);
+                try
+                {
+                    Directory.Delete(directory, true);
+                }
+                catch
+                {
+                }
+            }
         }
 
         private static void TestConversionFileStore()
@@ -193,6 +241,41 @@ namespace M3u8DownloaderGui
                     "  expected: " + expected + Environment.NewLine +
                     "  actual:   " + actual);
             }
+        }
+
+        private static void AssertPathEqual(string expected, string actual, string testName)
+        {
+            string expectedPath = expected == null ? null : Path.GetFullPath(expected);
+            string actualPath = actual == null ? null : Path.GetFullPath(actual);
+            if (!string.Equals(expectedPath, actualPath, StringComparison.OrdinalIgnoreCase))
+            {
+                _failed++;
+                Console.Error.WriteLine(
+                    "FAIL: " + testName + Environment.NewLine +
+                    "  expected: " + expectedPath + Environment.NewLine +
+                    "  actual:   " + actualPath);
+            }
+        }
+
+        private static void AssertContainsPath(
+            IEnumerable<string> paths,
+            string expected,
+            string testName)
+        {
+            string expectedPath = Path.GetFullPath(expected);
+            foreach (string path in paths)
+            {
+                if (string.Equals(
+                    expectedPath,
+                    Path.GetFullPath(path),
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    return;
+                }
+            }
+
+            _failed++;
+            Console.Error.WriteLine("FAIL: " + testName + Environment.NewLine + "  missing: " + expectedPath);
         }
 
         private static void AssertTrue(bool condition, string testName)

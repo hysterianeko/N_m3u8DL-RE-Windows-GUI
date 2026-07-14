@@ -8,8 +8,8 @@ using System.Windows.Forms;
 [assembly: AssemblyCompany("hysterianeko")]
 [assembly: AssemblyProduct("M3U8 Video Downloader")]
 [assembly: AssemblyCopyright("Copyright (c) 2026 hysterianeko")]
-[assembly: AssemblyVersion("1.2.0.0")]
-[assembly: AssemblyFileVersion("1.2.0.0")]
+[assembly: AssemblyVersion("1.2.1.0")]
+[assembly: AssemblyFileVersion("1.2.1.0")]
 
 namespace M3u8DownloaderGui
 {

@@ -12,8 +12,8 @@
 
 打开 [Releases](https://github.com/hysterianeko/N_m3u8DL-RE-Windows-GUI/releases/latest)，按需要下载：
 
-- `M3U8-Video-Downloader-v1.2.0-win-x64.exe`：单文件 GUI；电脑已有 `N_m3u8DL-RE` 和 FFmpeg 时可直接运行。
-- `M3U8-Video-Downloader-v1.2.0-win-x64.zip`：推荐给新用户，包含 GUI、快速开始和一键依赖安装脚本。
+- `M3U8-Video-Downloader-v1.2.1-win-x64.exe`：单文件 GUI；电脑已有 `N_m3u8DL-RE` 和 FFmpeg 时可直接运行。
+- `M3U8-Video-Downloader-v1.2.1-win-x64.zip`：推荐给新用户，包含 GUI、快速开始和一键依赖安装脚本。
 - `SHA256SUMS.txt`：两个发布文件的 SHA-256 校验值。
 
 轻量发布包不重新分发第三方可执行文件。首次解压 ZIP 后运行 `Setup-dependencies.cmd`：脚本会从 `nilaoda/N_m3u8DL-RE` 官方 GitHub Release 下载并校验 Windows x64 版本，并在需要时通过 WinGet 安装 FFmpeg。已经装好依赖时直接双击 GUI 即可。
@@ -25,7 +25,7 @@
 - 输入在线 `.m3u8`、`.mpd` 或本地播放列表文件。
 - 自动从 URL 推断名称；`index.m3u8` / `master.m3u8` 会使用有意义的父目录名。
 - 自动选择最佳视频、音频和字幕轨道，并默认混流为 MP4。
-- 自动查找 GUI 同目录、`tools`、用户下载目录、`PATH` 和 WinGet 中的外部工具。
+- 自动查找 GUI 同目录、`tools`、`PATH`、WinGet，以及各固定磁盘根部的 `Downloads` / `Download` / `下载` 目录中的外部工具。
 - 实时日志、取消整个进程树、完成提示和打开保存目录。
 - 拒绝无法由外部程序访问的 `blob:chrome-extension://...`，支持粘贴猫抓导出的完整 `#EXTM3U` 正文。
 - 手动 HLS AES-128 KEY/IV：支持 32 位 HEX、16 字节 Base64 和密钥文件。
@@ -86,7 +86,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 生成发布 EXE、轻量 ZIP 和校验文件：
 
 ```powershell
-.\package.ps1 -Version 1.2.0
+.\package.ps1 -Version 1.2.1
 ```
 
 构建脚本会先编译并运行 `SelfTests.exe`，再生成 DPI 感知的 WinForms EXE。开发细节见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。

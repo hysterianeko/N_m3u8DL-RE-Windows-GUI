@@ -6,7 +6,7 @@
 
 ## 工具路径标红
 
-推荐把下载器放在 GUI 同目录或 `tools` 子目录。FFmpeg 可以安装到系统 `PATH` 或 WinGet 默认位置：
+推荐把下载器放在 GUI 同目录、`tools` 子目录，或任一固定磁盘根部的 `Downloads` / `Download` / `下载` 目录（例如 `E:\Downloads`）。FFmpeg 可以安装到系统 `PATH` 或 WinGet 默认位置：
 
 ```text
 <程序目录>\N_m3u8DL-RE.exe

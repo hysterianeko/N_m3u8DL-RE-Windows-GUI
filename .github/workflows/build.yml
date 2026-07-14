@@ -47,7 +47,7 @@ jobs:
           $version = if ($env:GITHUB_REF_TYPE -eq 'tag') {
             $env:GITHUB_REF_NAME.TrimStart('v')
           } else {
-            '1.2.0-ci'
+            '1.2.1-ci'
           }
           .\package.ps1 -Version $version -SkipBuild
 

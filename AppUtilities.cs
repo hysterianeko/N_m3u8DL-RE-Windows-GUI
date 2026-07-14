@@ -171,26 +171,41 @@ namespace M3u8DownloaderGui
 
         public static string FindDownloader(string preferredPath)
         {
+            const string executableName = "N_m3u8DL-RE.exe";
             List<string> candidates = new List<string>();
             AddCandidate(candidates, preferredPath);
-            AddCandidate(candidates, Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "N_m3u8DL-RE.exe"));
-            AddCandidate(candidates, Path.Combine(AppDomain.CurrentDomain.BaseDirectory, @"tools\N_m3u8DL-RE.exe"));
-            AddCandidate(candidates, Path.Combine(AppDomain.CurrentDomain.BaseDirectory, @"..\tools\N_m3u8DL-RE.exe"));
+            AddCandidate(candidates, Path.Combine(AppDomain.CurrentDomain.BaseDirectory, executableName));
+            AddCandidate(candidates, Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tools", executableName));
+            AddCandidate(candidates, Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "tools", executableName));
             AddCandidate(
                 candidates,
                 Path.Combine(
                     GetDownloadsDirectory(),
-                    "N_m3u8DL-RE.exe"));
+                    executableName));
+
+            AddCandidate(
+                candidates,
+                FindInPathValues(
+                    executableName,
+                    Environment.GetEnvironmentVariable("PATH"),
+                    Environment.GetEnvironmentVariable("PATH", EnvironmentVariableTarget.User),
+                    Environment.GetEnvironmentVariable("PATH", EnvironmentVariableTarget.Machine)));
+
+            List<string> commonDirectories = GetCommonToolDirectories();
+            foreach (string directory in commonDirectories)
+            {
+                AddCandidate(candidates, Path.Combine(directory, executableName));
+            }
 
             string found = FirstExistingFile(candidates);
             if (found == null)
             {
-                found = FindWithWhereExe("N_m3u8DL-RE.exe");
+                found = FindWithWhereExe(executableName);
             }
 
             return found ?? (string.IsNullOrWhiteSpace(preferredPath)
-                ? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "N_m3u8DL-RE.exe")
-                : preferredPath.Trim());
+                ? Path.Combine(AppDomain.CurrentDomain.BaseDirectory, executableName)
+                : NormalizePath(preferredPath));
         }
 
         public static string FindFfmpeg(string preferredPath, string downloaderPath)
@@ -208,7 +223,7 @@ namespace M3u8DownloaderGui
             {
                 try
                 {
-                    string downloaderDirectory = Path.GetDirectoryName(downloaderPath.Trim());
+                    string downloaderDirectory = Path.GetDirectoryName(NormalizePath(downloaderPath));
                     if (!string.IsNullOrWhiteSpace(downloaderDirectory))
                     {
                         AddCandidate(candidates, Path.Combine(downloaderDirectory, "ffmpeg.exe"));
@@ -220,11 +235,22 @@ namespace M3u8DownloaderGui
                 }
             }
 
-            AddPathCandidates(candidates, Environment.GetEnvironmentVariable("PATH"));
-            AddPathCandidates(candidates, Environment.GetEnvironmentVariable("PATH", EnvironmentVariableTarget.User));
-            AddPathCandidates(candidates, Environment.GetEnvironmentVariable("PATH", EnvironmentVariableTarget.Machine));
+            AddCandidate(
+                candidates,
+                FindInPathValues(
+                    "ffmpeg.exe",
+                    Environment.GetEnvironmentVariable("PATH"),
+                    Environment.GetEnvironmentVariable("PATH", EnvironmentVariableTarget.User),
+                    Environment.GetEnvironmentVariable("PATH", EnvironmentVariableTarget.Machine)));
             AddCandidate(candidates, WinGetFfmpegLink);
             AddCandidate(candidates, @"C:\ffmpeg\bin\ffmpeg.exe");
+
+            List<string> commonDirectories = GetCommonToolDirectories();
+            foreach (string directory in commonDirectories)
+            {
+                AddCandidate(candidates, Path.Combine(directory, "ffmpeg.exe"));
+                AddCandidate(candidates, Path.Combine(directory, "bin", "ffmpeg.exe"));
+            }
 
             string found = FirstExistingFile(candidates);
             if (found != null)
@@ -244,7 +270,9 @@ namespace M3u8DownloaderGui
                 return found;
             }
 
-            return string.IsNullOrWhiteSpace(preferredPath) ? WinGetFfmpegLink : preferredPath.Trim();
+            return string.IsNullOrWhiteSpace(preferredPath)
+                ? WinGetFfmpegLink
+                : NormalizePath(preferredPath);
         }
 
         public static bool IsUsableExecutable(string path)
@@ -256,7 +284,7 @@ namespace M3u8DownloaderGui
 
             try
             {
-                return File.Exists(path.Trim());
+                return File.Exists(NormalizePath(path));
             }
             catch
             {
@@ -264,7 +292,10 @@ namespace M3u8DownloaderGui
             }
         }
 
-        private static void AddPathCandidates(List<string> candidates, string pathValue)
+        private static void AddPathCandidates(
+            List<string> candidates,
+            string pathValue,
+            string executableName)
         {
             if (string.IsNullOrWhiteSpace(pathValue))
             {
@@ -274,11 +305,117 @@ namespace M3u8DownloaderGui
             string[] directories = pathValue.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries);
             foreach (string directoryValue in directories)
             {
-                string directory = directoryValue.Trim().Trim('"');
+                string directory = NormalizePath(directoryValue);
                 if (directory.Length > 0)
                 {
-                    AddCandidate(candidates, Path.Combine(directory, "ffmpeg.exe"));
+                    AddCandidate(candidates, Path.Combine(directory, executableName));
                 }
+            }
+        }
+
+        internal static string FindInPathValues(string executableName, params string[] pathValues)
+        {
+            List<string> candidates = new List<string>();
+            if (pathValues != null)
+            {
+                foreach (string pathValue in pathValues)
+                {
+                    AddPathCandidates(candidates, pathValue, executableName);
+                }
+            }
+
+            return FirstExistingFile(candidates);
+        }
+
+        private static List<string> GetCommonToolDirectories()
+        {
+            List<string> fixedDriveRoots = new List<string>();
+
+            try
+            {
+                foreach (DriveInfo drive in DriveInfo.GetDrives())
+                {
+                    try
+                    {
+                        if (drive.DriveType == DriveType.Fixed && drive.IsReady)
+                        {
+                            fixedDriveRoots.Add(drive.RootDirectory.FullName);
+                        }
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+            catch
+            {
+            }
+
+            return BuildCommonToolDirectories(
+                GetDownloadsDirectory(),
+                Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    "Downloads"),
+                Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
+                fixedDriveRoots);
+        }
+
+        internal static List<string> BuildCommonToolDirectories(
+            string configuredDownloads,
+            string fallbackDownloads,
+            string desktopDirectory,
+            IEnumerable<string> fixedDriveRoots)
+        {
+            List<string> directories = new List<string>();
+            AddDirectory(directories, configuredDownloads);
+            AddDirectory(directories, fallbackDownloads);
+            AddDirectory(directories, desktopDirectory);
+
+            if (fixedDriveRoots != null)
+            {
+                foreach (string root in fixedDriveRoots)
+                {
+                    if (string.IsNullOrWhiteSpace(root))
+                    {
+                        continue;
+                    }
+
+                    AddDirectory(directories, Path.Combine(root, "Downloads"));
+                    AddDirectory(directories, Path.Combine(root, "Download"));
+                    AddDirectory(directories, Path.Combine(root, "下载"));
+                }
+            }
+
+            return directories;
+        }
+
+        private static void AddDirectory(List<string> directories, string directory)
+        {
+            if (string.IsNullOrWhiteSpace(directory))
+            {
+                return;
+            }
+
+            try
+            {
+                string fullPath = Path.GetFullPath(NormalizePath(directory));
+                if (!Directory.Exists(fullPath))
+                {
+                    return;
+                }
+
+                foreach (string existing in directories)
+                {
+                    if (string.Equals(existing, fullPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        return;
+                    }
+                }
+
+                directories.Add(fullPath);
+            }
+            catch
+            {
             }
         }
 
@@ -316,14 +453,38 @@ namespace M3u8DownloaderGui
                     return null;
                 }
 
-                string[] packages = Directory.GetDirectories(root, "Gyan.FFmpeg*");
+                string[] packages = Directory.GetDirectories(root, "*FFmpeg*", SearchOption.TopDirectoryOnly);
                 Array.Sort(packages, StringComparer.OrdinalIgnoreCase);
                 for (int index = packages.Length - 1; index >= 0; index--)
                 {
-                    string[] files = Directory.GetFiles(packages[index], "ffmpeg.exe", SearchOption.AllDirectories);
-                    if (files.Length > 0)
+                    List<string> candidates = new List<string>();
+                    AddCandidate(candidates, Path.Combine(packages[index], "ffmpeg.exe"));
+                    AddCandidate(candidates, Path.Combine(packages[index], "bin", "ffmpeg.exe"));
+
+                    string[] children;
+                    try
                     {
-                        return files[0];
+                        children = Directory.GetDirectories(
+                            packages[index],
+                            "*",
+                            SearchOption.TopDirectoryOnly);
+                        Array.Sort(children, StringComparer.OrdinalIgnoreCase);
+                    }
+                    catch
+                    {
+                        children = new string[0];
+                    }
+
+                    for (int childIndex = children.Length - 1; childIndex >= 0; childIndex--)
+                    {
+                        AddCandidate(candidates, Path.Combine(children[childIndex], "ffmpeg.exe"));
+                        AddCandidate(candidates, Path.Combine(children[childIndex], "bin", "ffmpeg.exe"));
+                    }
+
+                    string found = FirstExistingFile(candidates);
+                    if (found != null)
+                    {
+                        return found;
                     }
                 }
             }
@@ -381,8 +542,19 @@ namespace M3u8DownloaderGui
         {
             if (!string.IsNullOrWhiteSpace(candidate))
             {
-                candidates.Add(candidate.Trim());
+                candidates.Add(NormalizePath(candidate));
             }
+        }
+
+        internal static string NormalizePath(string path)
+        {
+            string normalized = Environment.ExpandEnvironmentVariables((path ?? string.Empty).Trim());
+            if (normalized.Length >= 2 && normalized[0] == '"' && normalized[normalized.Length - 1] == '"')
+            {
+                normalized = normalized.Substring(1, normalized.Length - 2).Trim();
+            }
+
+            return normalized;
         }
 
         private static string FirstExistingFile(List<string> candidates)
@@ -392,7 +564,7 @@ namespace M3u8DownloaderGui
             {
                 try
                 {
-                    string fullPath = Path.GetFullPath(candidate);
+                    string fullPath = Path.GetFullPath(NormalizePath(candidate));
                     if (checkedPaths.Add(fullPath) && File.Exists(fullPath))
                     {
                         return fullPath;

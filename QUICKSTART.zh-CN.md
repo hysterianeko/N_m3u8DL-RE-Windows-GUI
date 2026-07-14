@@ -7,7 +7,7 @@
 3. 如果电脑尚无 FFmpeg，脚本会通过 WinGet 安装 `Gyan.FFmpeg`。
 4. 安装完成后会启动 `M3U8-Video-Downloader.exe`。
 
-已经安装好两个工具时，可以直接双击 `M3U8-Video-Downloader.exe`。程序会依次检查同目录、`tools` 子目录、用户下载目录、`PATH` 和 WinGet 位置。路径也可以在界面中手动选择。
+已经安装好两个工具时，可以直接双击 `M3U8-Video-Downloader.exe`。程序会依次检查同目录、`tools` 子目录、`PATH`、WinGet，以及各固定磁盘根部的 `Downloads` / `Download` / `下载` 目录。路径也可以在界面中手动选择。
 
 ## 下载视频
 

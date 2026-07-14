@@ -91,7 +91,7 @@ The GitHub Actions workflow builds and smoke-tests the application on `windows-l
 ## Package
 
 ```powershell
-.\package.ps1 -Version 1.2.0
+.\package.ps1 -Version 1.2.1
 ```
 
 This creates a standalone GUI EXE, a lightweight Windows ZIP, and `SHA256SUMS.txt` under `dist`. The ZIP intentionally does not redistribute N_m3u8DL-RE or FFmpeg binaries. It contains the verified dependency setup script and third-party notices instead.

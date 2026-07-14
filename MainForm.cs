@@ -847,13 +847,23 @@ namespace M3u8DownloaderGui
             _ffmpegPathTextBox.Text = ffmpeg;
             UpdateToolStatus();
 
-            if (ToolLocator.IsUsableExecutable(downloader) && ToolLocator.IsUsableExecutable(ffmpeg))
+            bool downloaderReady = ToolLocator.IsUsableExecutable(downloader);
+            bool ffmpegReady = ToolLocator.IsUsableExecutable(ffmpeg);
+            if (downloaderReady && ffmpegReady)
             {
                 _statusLabel.Text = "已找到下载程序和 FFmpeg";
             }
+            else if (!downloaderReady && !ffmpegReady)
+            {
+                _statusLabel.Text = "未找到 N_m3u8DL-RE.exe 和 ffmpeg.exe";
+            }
+            else if (!downloaderReady)
+            {
+                _statusLabel.Text = "未找到 N_m3u8DL-RE.exe；请检查下载程序路径";
+            }
             else
             {
-                _statusLabel.Text = "有工具未找到，请使用“浏览...”指定路径";
+                _statusLabel.Text = "未找到 ffmpeg.exe；请检查 FFmpeg 路径";
             }
         }
 
@@ -876,7 +886,11 @@ namespace M3u8DownloaderGui
             }
             else
             {
-                _toolStatusLabel.Text = "请检查标红的工具路径";
+                _toolStatusLabel.Text = !downloaderReady && !ffmpegReady
+                    ? "未找到 N_m3u8DL-RE.exe 和 ffmpeg.exe"
+                    : (!downloaderReady
+                        ? "未找到 N_m3u8DL-RE.exe"
+                        : "未找到 ffmpeg.exe");
                 _toolStatusLabel.ForeColor = DangerColor;
             }
         }

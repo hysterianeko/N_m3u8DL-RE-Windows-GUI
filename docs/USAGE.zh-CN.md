@@ -6,8 +6,8 @@
 
 | 工具 | 用途 | 自动查找位置 |
 | --- | --- | --- |
-| `N_m3u8DL-RE.exe` | 解析和下载 HLS/DASH | GUI 同目录、`tools`、用户下载目录 |
-| `ffmpeg.exe` | 检测、混流和重新封装 | GUI 同目录、`tools`、`PATH`、WinGet |
+| `N_m3u8DL-RE.exe` | 解析和下载 HLS/DASH | GUI 同目录、`tools`、三类 `PATH`、各固定磁盘根部的下载目录 |
+| `ffmpeg.exe` | 检测、混流和重新封装 | GUI 同目录、`tools`、三类 `PATH`、WinGet、各固定磁盘根部的下载目录 |
 
 路径存在时，“工具路径”下方会显示“工具已就绪”。路径标红时，点击对应的“浏览...”或“自动检测”。
 

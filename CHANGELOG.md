@@ -2,6 +2,15 @@
 
 All notable changes to this project are documented here.
 
+## 1.2.1 - 2026-07-14
+
+### Fixed
+
+- Detect `N_m3u8DL-RE.exe` from process, user, and machine PATH values.
+- Check common Downloads folders on every ready fixed drive without performing a recursive drive scan.
+- Expand environment variables and outer quotes in configured tool paths.
+- Identify the specific missing dependency in the automatic detection status message.
+
 ## 1.2.0 - 2026-07-13
 
 ### Added
