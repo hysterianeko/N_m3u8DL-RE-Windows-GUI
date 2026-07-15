@@ -2,6 +2,22 @@
 
 All notable changes to this project are documented here.
 
+## 1.2.3 - 2026-07-15
+
+### Added
+
+- Detect missing downloader and FFmpeg tools when the GUI first opens or an operation needs them, then offer verified automatic download, manual browsing, or deferral.
+- Download pinned dependencies by direct HTTPS connections to GitHub Release assets without using the Windows system proxy, with visible progress, cancellation, controlled extraction, and atomic installation into the current user's LocalAppData.
+
+### Fixed
+
+- Run broad external-tool discovery outside the UI thread, require only FFmpeg for file conversion, and reject accidentally selected executables with the wrong filename.
+- Keep verified tools and a completed progress state after installation while suppressing failure prompts during a confirmed window close.
+- Read redirected downloader output as raw character chunks so segment progress reaches the GUI before a newline or process exit.
+- Split concatenated timestamped records into readable lines and compact high-frequency terminal redraws into periodic progress milestones.
+- Update the numeric progress bar from the current media track without allowing delayed progress to overwrite merging or cancellation states.
+- Bound output-pipe shutdown, close the process Job before draining inherited handles, and preserve FFmpeg conversion logging.
+
 ## 1.2.2 - 2026-07-14
 
 ### Fixed

@@ -1,9 +1,10 @@
 param(
-    [string]$Version = '1.2.2',
+    [string]$Version = '1.2.3',
     [switch]$SkipBuild
 )
 
 $ErrorActionPreference = 'Stop'
+
 $projectDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $buildDirectory = Join-Path $projectDirectory 'build'
 $distDirectory = Join-Path $projectDirectory 'dist'

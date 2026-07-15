@@ -9,9 +9,11 @@
 | `N_m3u8DL-RE.exe` | 解析和下载 HLS/DASH | GUI 同目录、`tools`、三类 `PATH`、各固定磁盘根部的下载目录 |
 | `ffmpeg.exe` | 检测、混流和重新封装 | GUI 同目录、`tools`、三类 `PATH`、WinGet、各固定磁盘根部的下载目录 |
 
-路径存在时，“工具路径”下方会显示“工具已就绪”。路径标红时，点击对应的“浏览...”或“自动检测”。
+路径存在时，“工具路径”下方会显示“工具已就绪”。程序首次显示窗口时会自动检测；路径标红时会提示直连 GitHub Release 自动下载、浏览指定文件或暂不处理。点击“自动检测”、开始下载或转换文件时也会重新检查。
 
-Release ZIP 用户可以直接运行 `Setup-dependencies.cmd`。该脚本从 `nilaoda/N_m3u8DL-RE` 官方 Release 下载并校验固定版本，并在缺少 FFmpeg 时调用 WinGet。源码用户也可以在仓库根目录运行 `setup-dependencies.ps1`。
+GUI 自动下载固定的 `N_m3u8DL-RE 0.6.0-beta` 和 Gyan FFmpeg `8.1.2 essentials`，使用不经过 Windows 系统代理的 HTTPS 连接直连 GitHub Release，校验下载长度、压缩包 SHA-256、解压长度和最终 EXE SHA-256 后才安装到 `%LOCALAPPDATA%\N_m3u8DL-RE-GUI\tools`。取消、失败或关闭窗口不会覆盖原有可用工具，并会清理本次临时文件。
+
+Release ZIP 中的 `Setup-dependencies.cmd` 和源码目录中的 `setup-dependencies.ps1` 仍可作为备用安装方式。
 
 使用 WinGet 安装 FFmpeg：
 
@@ -119,6 +121,7 @@ HEX 前缀 `0x` 或 `0X` 会自动移除。IV 也是 16 字节；播放列表没
 ## 6. 保存和日志
 
 - “完成后打开目录”会在成功后打开实际输出目录。
+- 下载器即使不输出换行，界面仍会从原始字符流实时提取当前轨道的分片数和百分比；运行日志每约 5% 保留一条简洁里程碑，不保存每次终端重绘。
 - “复制日志”复制当前窗口日志；分享前仍应人工检查 URL token、Cookie 和站点标识。
 - “清空”会同时清空界面和尚未刷新到界面的日志队列。
 - 设置文件只包含工具路径、保存目录和完成选项，位于：

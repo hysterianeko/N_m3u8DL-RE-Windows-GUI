@@ -134,8 +134,8 @@ namespace M3u8DownloaderGui
         {
             UserSettings settings = new UserSettings();
             settings.SaveDirectory = ToolLocator.GetDefaultSaveDirectory();
-            settings.DownloaderPath = ToolLocator.FindDownloader(null);
-            settings.FfmpegPath = ToolLocator.FindFfmpeg(null, settings.DownloaderPath);
+            settings.DownloaderPath = string.Empty;
+            settings.FfmpegPath = string.Empty;
             return settings;
         }
 
@@ -192,6 +192,539 @@ namespace M3u8DownloaderGui
         }
     }
 
+    internal sealed class ExternalToolProgress
+    {
+        public string StreamKind;
+        public int Current;
+        public int Total;
+        public double Percent;
+        public string DownloadedSize;
+        public string TotalSize;
+        public string Speed;
+        public string RemainingTime;
+
+        public string Identity
+        {
+            get
+            {
+                return (StreamKind ?? string.Empty) + "|" +
+                       Current + "|" + Total + "|" +
+                       Percent.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture) + "|" +
+                       (DownloadedSize ?? string.Empty) + "|" +
+                       (TotalSize ?? string.Empty) + "|" +
+                       (Speed ?? string.Empty) + "|" +
+                       (RemainingTime ?? string.Empty);
+            }
+        }
+    }
+
+    internal sealed class ExternalToolOutputParser
+    {
+        private const int MaximumPendingCharacters = 65536;
+        private const string TimestampHeaderPattern =
+            @"(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{3})?[ \t]+" +
+            @"(?:TRACE|DEBUG|INFO|WARN|ERROR|FATAL)[ \t]*:[ \t]*";
+
+        private static readonly Regex TimestampHeader = new Regex(
+            TimestampHeaderPattern,
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+        private static readonly Regex ProgressFrame = new Regex(
+            @"(?<kind>Vid|Aud|Sub)\b" +
+            @"(?:(?!(?:" + TimestampHeaderPattern + @")|(?:Vid|Aud|Sub)\b).){0,768}?" +
+            @"(?<current>\d{1,9})/(?<total>\d{1,9})\s+" +
+            @"(?<percent>\d{1,3}(?:\.\d+)?)%",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant |
+            RegexOptions.Compiled | RegexOptions.Singleline);
+
+        private static readonly Regex ProgressDetails = new Regex(
+            @"^\s*(?<downloaded>\d+(?:\.\d+)?\s*[KMGT]?B)" +
+            @"(?:/(?<size>\d+(?:\.\d+)?\s*[KMGT]?B))?\s*" +
+            @"(?<speed>(?:\d+(?:\.\d+)?\s*[KMGT]?Bps|-))?\s*" +
+            @"(?<eta>\d{2}:\d{2}:\d{2})?",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+        private static readonly Regex AnsiCsi = new Regex(
+            "\\x1B\\[[0-?]*[ -/]*[@-~]",
+            RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+        private static readonly Regex AnsiOsc = new Regex(
+            "\\x1B\\][^\\x07]*(?:\\x07|\\x1B\\\\)",
+            RegexOptions.CultureInvariant | RegexOptions.Compiled);
+
+        private readonly StringBuilder _pending = new StringBuilder();
+        private readonly Action<string> _logHandler;
+        private readonly Action<ExternalToolProgress> _progressHandler;
+        private string _lastProgressIdentity = string.Empty;
+        private DateTime _lastProgressEmittedUtc = DateTime.MinValue;
+        private bool _reportedCompaction;
+        private bool _reportedOversizedLog;
+
+        public ExternalToolOutputParser(
+            Action<string> logHandler,
+            Action<ExternalToolProgress> progressHandler)
+        {
+            _logHandler = logHandler;
+            _progressHandler = progressHandler;
+        }
+
+        public void Append(string chunk)
+        {
+            if (string.IsNullOrEmpty(chunk))
+            {
+                return;
+            }
+
+            _pending.Append(chunk.Replace("\r\n", "\n").Replace('\r', '\n'));
+            DrainCompleteRecords(false);
+            TryEmitLatestProgress(_pending.ToString());
+
+            if (_pending.Length > MaximumPendingCharacters)
+            {
+                CompactOversizedPendingText();
+            }
+        }
+
+        public void Complete()
+        {
+            DrainCompleteRecords(true);
+        }
+
+        private void DrainCompleteRecords(bool flushAll)
+        {
+            while (_pending.Length > 0)
+            {
+                if (_pending[0] == '\n')
+                {
+                    _pending.Remove(0, 1);
+                    continue;
+                }
+
+                string text = _pending.ToString();
+                int boundary = FindNextBoundary(text);
+                if (boundary < 0)
+                {
+                    if (flushAll)
+                    {
+                        EmitRecord(text);
+                        _pending.Clear();
+                    }
+
+                    return;
+                }
+
+                if (boundary == 0)
+                {
+                    _pending.Remove(0, 1);
+                    continue;
+                }
+
+                EmitRecord(text.Substring(0, boundary));
+                _pending.Remove(0, boundary);
+            }
+        }
+
+        private static int FindNextBoundary(string text)
+        {
+            int searchStart = 1;
+            Match timestampAtStart = TimestampHeader.Match(text);
+            if (timestampAtStart.Success && timestampAtStart.Index == 0)
+            {
+                searchStart = Math.Max(searchStart, timestampAtStart.Length);
+                Match attachedProgress = ProgressFrame.Match(text, searchStart);
+                if (attachedProgress.Success && attachedProgress.Index == searchStart)
+                {
+                    searchStart = attachedProgress.Groups["kind"].Index +
+                                  attachedProgress.Groups["kind"].Length;
+                }
+            }
+            else
+            {
+                Match progressAtStart = ProgressFrame.Match(text);
+                if (progressAtStart.Success && progressAtStart.Index == 0)
+                {
+                    searchStart = progressAtStart.Groups["kind"].Length;
+                }
+            }
+
+            int boundary = text.IndexOf('\n', searchStart);
+            Match timestamp = TimestampHeader.Match(text, searchStart);
+            if (timestamp.Success && (boundary < 0 || timestamp.Index < boundary))
+            {
+                boundary = timestamp.Index;
+            }
+
+            Match progress = ProgressFrame.Match(text, searchStart);
+            if (progress.Success && (boundary < 0 || progress.Index < boundary))
+            {
+                boundary = progress.Index;
+            }
+
+            return boundary;
+        }
+
+        private void EmitRecord(string rawRecord)
+        {
+            string record = Sanitize(rawRecord).Trim();
+            if (record.Length == 0)
+            {
+                return;
+            }
+
+            ExternalToolProgress progress;
+            if (TryParseProgress(record, out progress))
+            {
+                EmitProgress(progress);
+                return;
+            }
+
+            if (_logHandler != null)
+            {
+                _logHandler(record);
+            }
+        }
+
+        private void TryEmitLatestProgress(string text)
+        {
+            MatchCollection matches = ProgressFrame.Matches(text);
+            if (matches.Count == 0)
+            {
+                return;
+            }
+
+            ExternalToolProgress progress;
+            if (TryCreateProgress(text, matches[matches.Count - 1], out progress))
+            {
+                EmitProgress(progress);
+            }
+        }
+
+        private void EmitProgress(ExternalToolProgress progress)
+        {
+            if (progress == null || _progressHandler == null)
+            {
+                return;
+            }
+
+            string identity = progress.Identity;
+            DateTime now = DateTime.UtcNow;
+            bool positionChanged =
+                string.IsNullOrEmpty(_lastProgressIdentity) ||
+                !SameProgressPosition(_lastProgressIdentity, progress);
+            if (!positionChanged &&
+                string.Equals(identity, _lastProgressIdentity, StringComparison.Ordinal) ||
+                (!positionChanged && (now - _lastProgressEmittedUtc).TotalMilliseconds < 250))
+            {
+                return;
+            }
+
+            _lastProgressIdentity = identity;
+            _lastProgressEmittedUtc = now;
+            _progressHandler(progress);
+        }
+
+        private static bool SameProgressPosition(string identity, ExternalToolProgress progress)
+        {
+            string prefix = (progress.StreamKind ?? string.Empty) + "|" +
+                            progress.Current + "|" + progress.Total + "|" +
+                            progress.Percent.ToString(
+                                "0.00",
+                                System.Globalization.CultureInfo.InvariantCulture) + "|";
+            return identity.StartsWith(prefix, StringComparison.Ordinal);
+        }
+
+        private static bool TryParseProgress(string text, out ExternalToolProgress progress)
+        {
+            MatchCollection matches = ProgressFrame.Matches(text);
+            if (matches.Count == 0)
+            {
+                progress = null;
+                return false;
+            }
+
+            return TryCreateProgress(text, matches[matches.Count - 1], out progress);
+        }
+
+        private static bool TryCreateProgress(
+            string text,
+            Match match,
+            out ExternalToolProgress progress)
+        {
+            int current;
+            int total;
+            double percent;
+            if (!int.TryParse(match.Groups["current"].Value, out current) ||
+                !int.TryParse(match.Groups["total"].Value, out total) ||
+                !double.TryParse(
+                    match.Groups["percent"].Value,
+                    System.Globalization.NumberStyles.Float,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out percent) ||
+                total <= 0 || current < 0 || current > total ||
+                percent < 0 || percent > 100)
+            {
+                progress = null;
+                return false;
+            }
+
+            string tail = match.Index + match.Length < text.Length
+                ? text.Substring(match.Index + match.Length)
+                : string.Empty;
+            Match details = ProgressDetails.Match(tail);
+            progress = new ExternalToolProgress();
+            progress.StreamKind = NormalizeStreamKind(match.Groups["kind"].Value);
+            progress.Current = current;
+            progress.Total = total;
+            progress.Percent = percent;
+            if (details.Success)
+            {
+                progress.DownloadedSize = details.Groups["downloaded"].Value.Replace(" ", string.Empty);
+                progress.TotalSize = details.Groups["size"].Value.Replace(" ", string.Empty);
+                progress.Speed = details.Groups["speed"].Value.Replace(" ", string.Empty);
+                progress.RemainingTime = details.Groups["eta"].Value;
+            }
+
+            return true;
+        }
+
+        private static string NormalizeStreamKind(string value)
+        {
+            if (string.Equals(value, "Aud", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Aud";
+            }
+
+            if (string.Equals(value, "Sub", StringComparison.OrdinalIgnoreCase))
+            {
+                return "Sub";
+            }
+
+            return "Vid";
+        }
+
+        private void CompactOversizedPendingText()
+        {
+            string text = _pending.ToString();
+            ExternalToolProgress progress;
+            bool wasProgress = TryParseProgress(text, out progress);
+            if (wasProgress)
+            {
+                EmitProgress(progress);
+                _pending.Clear();
+                int progressTail = Math.Min(2048, text.Length);
+                _pending.Append(text.Substring(text.Length - progressTail));
+                if (!_reportedCompaction && _logHandler != null)
+                {
+                    _reportedCompaction = true;
+                    _logHandler("[GUI] 已压缩下载器的高频进度输出。");
+                }
+
+                return;
+            }
+
+            int headLength = Math.Min(32768, text.Length);
+            if (_logHandler != null)
+            {
+                string head = Sanitize(text.Substring(0, headLength)).Trim();
+                if (head.Length > 0)
+                {
+                    _logHandler(head + " [单条日志过长，后续内容已截断]");
+                }
+
+                if (!_reportedOversizedLog)
+                {
+                    _reportedOversizedLog = true;
+                    _logHandler("[GUI] 下载器输出了一条超长日志，界面仅保留其开头和最新尾部。");
+                }
+            }
+
+            _pending.Clear();
+            int logTail = Math.Min(2048, text.Length - headLength);
+            if (logTail > 0)
+            {
+                _pending.Append(text.Substring(text.Length - logTail));
+            }
+        }
+
+        private static string Sanitize(string value)
+        {
+            string withoutAnsi = AnsiOsc.Replace(AnsiCsi.Replace(value ?? string.Empty, string.Empty), string.Empty);
+            StringBuilder result = new StringBuilder(withoutAnsi.Length);
+            foreach (char character in withoutAnsi)
+            {
+                if (character == '\t' ||
+                    (character >= ' ' && !(character >= '\u0080' && character <= '\u009F')))
+                {
+                    result.Append(character);
+                }
+            }
+
+            return result.ToString();
+        }
+    }
+
+    internal sealed class ProcessOutputPump
+    {
+        private readonly TextReader _standardOutput;
+        private readonly TextReader _standardError;
+        private readonly Action<string> _outputHandler;
+        private readonly Action<string> _errorHandler;
+        private readonly Action _outputCompleted;
+        private readonly Action _errorCompleted;
+        private Thread _outputThread;
+        private Thread _errorThread;
+        private bool _started;
+        private volatile bool _stopRequested;
+
+        public ProcessOutputPump(
+            TextReader standardOutput,
+            TextReader standardError,
+            Action<string> outputHandler,
+            Action<string> errorHandler,
+            Action outputCompleted,
+            Action errorCompleted)
+        {
+            _standardOutput = standardOutput;
+            _standardError = standardError;
+            _outputHandler = outputHandler;
+            _errorHandler = errorHandler;
+            _outputCompleted = outputCompleted;
+            _errorCompleted = errorCompleted;
+        }
+
+        public void Start()
+        {
+            if (_started)
+            {
+                throw new InvalidOperationException("The process output pump has already started.");
+            }
+
+            _started = true;
+            _outputThread = CreateReaderThread(
+                "M3U8 GUI stdout reader",
+                _standardOutput,
+                _outputHandler,
+                _outputCompleted);
+            _errorThread = CreateReaderThread(
+                "M3U8 GUI stderr reader",
+                _standardError,
+                _errorHandler,
+                _errorCompleted);
+            _outputThread.Start();
+            _errorThread.Start();
+        }
+
+        public bool WaitForCompletion()
+        {
+            return WaitForCompletion(5000);
+        }
+
+        public bool WaitForCompletion(int timeoutMilliseconds)
+        {
+            Stopwatch stopwatch = Stopwatch.StartNew();
+            bool outputCompleted = JoinReader(_outputThread, timeoutMilliseconds);
+            int remaining = Math.Max(0, timeoutMilliseconds - (int)stopwatch.ElapsedMilliseconds);
+            bool errorCompleted = JoinReader(_errorThread, remaining);
+            return outputCompleted && errorCompleted;
+        }
+
+        public void Stop()
+        {
+            _stopRequested = true;
+            try
+            {
+                if (_standardOutput != null)
+                {
+                    _standardOutput.Dispose();
+                }
+            }
+            catch
+            {
+            }
+
+            try
+            {
+                if (_standardError != null)
+                {
+                    _standardError.Dispose();
+                }
+            }
+            catch
+            {
+            }
+        }
+
+        private Thread CreateReaderThread(
+            string name,
+            TextReader reader,
+            Action<string> handler,
+            Action completed)
+        {
+            Thread thread = new Thread(delegate()
+            {
+                try
+                {
+                    char[] buffer = new char[2048];
+                    int read;
+                    while (reader != null && (read = reader.Read(buffer, 0, buffer.Length)) > 0)
+                    {
+                        if (!_stopRequested && handler != null)
+                        {
+                            try
+                            {
+                                handler(new string(buffer, 0, read));
+                            }
+                            catch
+                            {
+                            }
+                        }
+                    }
+                }
+                catch
+                {
+                }
+                finally
+                {
+                    if (!_stopRequested && completed != null)
+                    {
+                        try
+                        {
+                            completed();
+                        }
+                        catch
+                        {
+                        }
+                    }
+                }
+            });
+            thread.IsBackground = true;
+            thread.Name = name;
+            return thread;
+        }
+
+        private static bool JoinReader(Thread thread, int timeoutMilliseconds)
+        {
+            if (thread == null)
+            {
+                return true;
+            }
+
+            if (ReferenceEquals(Thread.CurrentThread, thread))
+            {
+                return false;
+            }
+
+            try
+            {
+                return !thread.IsAlive || thread.Join(Math.Max(0, timeoutMilliseconds));
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
+
     internal static class ToolLocator
     {
         private static readonly string WinGetFfmpegLink = Path.Combine(
@@ -203,6 +736,14 @@ namespace M3u8DownloaderGui
             return Path.Combine(GetDownloadsDirectory(), "Videos");
         }
 
+        internal static string GetManagedToolsDirectory()
+        {
+            return Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "N_m3u8DL-RE-GUI",
+                "tools");
+        }
+
         public static string FindDownloader(string preferredPath)
         {
             const string executableName = "N_m3u8DL-RE.exe";
@@ -211,6 +752,7 @@ namespace M3u8DownloaderGui
             AddCandidate(candidates, Path.Combine(AppDomain.CurrentDomain.BaseDirectory, executableName));
             AddCandidate(candidates, Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "tools", executableName));
             AddCandidate(candidates, Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", "tools", executableName));
+            AddCandidate(candidates, Path.Combine(GetManagedToolsDirectory(), executableName));
             AddCandidate(
                 candidates,
                 Path.Combine(
@@ -252,6 +794,7 @@ namespace M3u8DownloaderGui
             AddCandidate(candidates, Path.Combine(AppDomain.CurrentDomain.BaseDirectory, @"tools\bin\ffmpeg.exe"));
             AddCandidate(candidates, Path.Combine(AppDomain.CurrentDomain.BaseDirectory, @"..\tools\ffmpeg.exe"));
             AddCandidate(candidates, Path.Combine(AppDomain.CurrentDomain.BaseDirectory, @"..\tools\bin\ffmpeg.exe"));
+            AddCandidate(candidates, Path.Combine(GetManagedToolsDirectory(), "ffmpeg.exe"));
 
             if (!string.IsNullOrWhiteSpace(downloaderPath))
             {
@@ -318,7 +861,8 @@ namespace M3u8DownloaderGui
 
             try
             {
-                return File.Exists(NormalizePath(path));
+                string fullPath = Path.GetFullPath(NormalizePath(path));
+                return File.Exists(fullPath) && IsSaneManagedTool(fullPath);
             }
             catch
             {
@@ -548,17 +1092,18 @@ namespace M3u8DownloaderGui
                         return null;
                     }
 
-                    string output = process.StandardOutput.ReadToEnd();
                     if (!process.WaitForExit(3000))
                     {
                         process.Kill();
+                        process.WaitForExit(1000);
                         return null;
                     }
+                    string output = process.StandardOutput.ReadToEnd();
 
                     string[] lines = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
                     foreach (string line in lines)
                     {
-                        if (File.Exists(line.Trim()))
+                        if (IsUsableExecutable(line.Trim()))
                         {
                             return line.Trim();
                         }
@@ -599,7 +1144,9 @@ namespace M3u8DownloaderGui
                 try
                 {
                     string fullPath = Path.GetFullPath(NormalizePath(candidate));
-                    if (checkedPaths.Add(fullPath) && File.Exists(fullPath))
+                    if (checkedPaths.Add(fullPath) &&
+                        File.Exists(fullPath) &&
+                        IsSaneManagedTool(fullPath))
                     {
                         return fullPath;
                     }
@@ -610,6 +1157,50 @@ namespace M3u8DownloaderGui
             }
 
             return null;
+        }
+
+        private static bool IsSaneManagedTool(string path)
+        {
+            try
+            {
+                string managedDirectory = Path.GetFullPath(GetManagedToolsDirectory())
+                    .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+                string directory = Path.GetDirectoryName(Path.GetFullPath(path));
+                if (!string.Equals(
+                    managedDirectory,
+                    directory,
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+
+                string fileName = Path.GetFileName(path);
+                long expectedLength;
+                if (string.Equals(
+                    fileName,
+                    "N_m3u8DL-RE.exe",
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    expectedLength = DependencyInstaller.DownloaderExecutableLength;
+                }
+                else if (string.Equals(
+                    fileName,
+                    "ffmpeg.exe",
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    expectedLength = DependencyInstaller.FfmpegExecutableLength;
+                }
+                else
+                {
+                    return true;
+                }
+
+                return new FileInfo(path).Length == expectedLength;
+            }
+            catch
+            {
+                return false;
+            }
         }
     }
 

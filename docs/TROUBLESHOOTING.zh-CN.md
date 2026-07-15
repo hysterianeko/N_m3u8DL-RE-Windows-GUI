@@ -14,7 +14,7 @@
 %LOCALAPPDATA%\Microsoft\WinGet\Links\ffmpeg.exe
 ```
 
-点击“自动检测”或“浏览...”重新选择。Release ZIP 用户也可以运行 `Setup-dependencies.cmd`。WinGet 安装 FFmpeg 后需要重新启动程序。
+点击“自动检测”后可选择自动下载或浏览本机文件。GUI 自动下载会直连 GitHub Release，不使用 Windows 系统代理；失败时先确认当前网络可以直接访问 GitHub，再重试或改用“浏览...”。工具会保存到 `%LOCALAPPDATA%\N_m3u8DL-RE-GUI\tools`，不需要管理员权限。Release ZIP 用户也可以运行备用的 `Setup-dependencies.cmd`；该备用脚本遵循 PowerShell 和 WinGet 自身的网络设置。
 
 ## Blob 地址无法下载
 
@@ -82,3 +82,7 @@ Get-FileHash .\M3U8视频下载器.exe -Algorithm SHA256
 ## 下载器中文日志显示乱码
 
 1.2.2 已按照当前 Windows 系统 ANSI 代码页读取 `N_m3u8DL-RE` 输出，同时继续按 UTF-8 读取 FFmpeg。旧版本出现 `����` 时请升级；`--no-ansi-color` 只控制颜色，不能修复编码。
+
+## 下载进度在结束时一次性出现
+
+部分 `N_m3u8DL-RE` 版本在输出被重定向时会删除进度重绘使用的换行和光标控制符。1.2.3 改为直接读取原始字符块，实时提取当前视频、音频或字幕轨的分片数和百分比；重复重绘不会再形成几十万字符的单行日志。真正开始二进制合并或混流后，进度条会切回活动状态，最终以“下载完成”或错误状态为准。

@@ -2,12 +2,12 @@
 
 ## 第一次使用
 
-1. 双击 `Setup-dependencies.cmd`。
-2. 脚本会从 `nilaoda/N_m3u8DL-RE` 官方 GitHub Release 下载并校验 Windows x64 版本。
-3. 如果电脑尚无 FFmpeg，脚本会通过 WinGet 安装 `Gyan.FFmpeg`。
-4. 安装完成后会启动 `M3U8-Video-Downloader.exe`。
+1. 双击 `M3U8-Video-Downloader.exe`。
+2. 程序会自动查找电脑中已有的 `N_m3u8DL-RE.exe` 和 `ffmpeg.exe`。
+3. 缺少工具时选择“是”可直连 GitHub Release 自动下载（不使用 Windows 系统代理），选择“否”可浏览并指定本机文件，选择“取消”则暂不处理。
+4. 自动下载会固定版本并校验 SHA-256，不需要管理员权限；通常总下载量约 38 MB。
 
-已经安装好两个工具时，可以直接双击 `M3U8-Video-Downloader.exe`。程序会依次检查同目录、`tools` 子目录、`PATH`、WinGet，以及各固定磁盘根部的 `Downloads` / `Download` / `下载` 目录。路径也可以在界面中手动选择。
+已经安装好两个工具时不会重复下载。程序会优先检查已保存路径、GUI 同目录和便携 `tools` 子目录，再检查受管理工具目录、`PATH`、WinGet，以及各固定磁盘根部的 `Downloads` / `Download` / `下载` 目录。路径也可以在界面中手动选择。ZIP 中的 `Setup-dependencies.cmd` 仅作为备用安装方式。
 
 ## 下载视频
 

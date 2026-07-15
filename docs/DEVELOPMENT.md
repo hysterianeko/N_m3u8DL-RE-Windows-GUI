@@ -27,6 +27,7 @@ Framework references:
 | `MainForm.cs` | Main UI, process lifecycle, logs, download and conversion operations |
 | `HlsKeyDialog.cs` | Manual HLS key/IV input and validation UI |
 | `AppUtilities.cs` | Settings, tool discovery, filename parsing, playlist checks, key handling, command quoting, Job Object |
+| `DependencyInstaller.cs` | Pinned direct GitHub downloads without the Windows system proxy, hash verification, controlled extraction, cancellation, atomic install |
 | `SelfTests.cs` | Dependency-free unit and platform tests |
 | `app.manifest` | DPI awareness, supported Windows versions, execution level |
 | `build.ps1` | Deterministic compiler invocation and test runner |
@@ -85,15 +86,18 @@ Current self-tests cover:
 - Relative segment, key, map, media, scheme-relative, and MPD BaseURL detection.
 - AES-128 HEX/Base64 parsing and protected temporary file lifecycle.
 - Downloader/FFmpeg output encoding selection and owned download temporary-directory cleanup.
-- Disabled operation-button appearance while an external process is active.
+- Raw downloader output pumping, concatenated timestamp splitting, Unicode/barless progress parsing, progress compaction, and bounded pipe shutdown.
+- Download phase monotonicity, cancellation priority, progress milestone deduplication, and the one-million-character log limit.
+- Disabled operation-button appearance and numeric progress state while an external process is active.
 - Settings/tool defaults through GUI smoke initialization.
+- Dependency catalog hashes, managed LocalAppData tool path, cancellable SHA-256, and controlled ZIP payload extraction.
 
 The GitHub Actions workflow builds and smoke-tests the application on `windows-latest` and uploads the EXE as a workflow artifact.
 
 ## Package
 
 ```powershell
-.\package.ps1 -Version 1.2.2
+.\package.ps1 -Version 1.2.3
 ```
 
 This creates a standalone GUI EXE, a lightweight Windows ZIP, and `SHA256SUMS.txt` under `dist`. The ZIP intentionally does not redistribute N_m3u8DL-RE or FFmpeg binaries. It contains the verified dependency setup script and third-party notices instead.

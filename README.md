@@ -12,13 +12,13 @@
 
 打开 [Releases](https://github.com/hysterianeko/N_m3u8DL-RE-Windows-GUI/releases/latest)，按需要下载：
 
-- `M3U8-Video-Downloader-v1.2.2-win-x64.exe`：单文件 GUI；电脑已有 `N_m3u8DL-RE` 和 FFmpeg 时可直接运行。
-- `M3U8-Video-Downloader-v1.2.2-win-x64.zip`：推荐给新用户，包含 GUI、快速开始和一键依赖安装脚本。
+- `M3U8-Video-Downloader-v1.2.3-win-x64.exe`：单文件 GUI；启动后会自动检测工具，缺失时可选择自动下载、浏览本机文件或暂不处理。
+- `M3U8-Video-Downloader-v1.2.3-win-x64.zip`：包含同一个 GUI、快速开始和备用依赖安装脚本。
 - `SHA256SUMS.txt`：两个发布文件的 SHA-256 校验值。
 
-轻量发布包不重新分发第三方可执行文件。首次解压 ZIP 后运行 `Setup-dependencies.cmd`：脚本会从 `nilaoda/N_m3u8DL-RE` 官方 GitHub Release 下载并校验 Windows x64 版本，并在需要时通过 WinGet 安装 FFmpeg。已经装好依赖时直接双击 GUI 即可。
+发布包不捆绑第三方可执行文件，因此仍然很小。GUI 会先自动查找现有工具；只有缺失且用户明确选择“自动下载”时，才使用当前网络直连固定的 GitHub Release，不读取 Windows 系统代理，并在下载后校验 SHA-256。通常下载 `N_m3u8DL-RE` 约 5 MB、FFmpeg Essentials 约 32 MB，安装到当前用户的 `%LOCALAPPDATA%\N_m3u8DL-RE-GUI\tools`，不需要管理员权限。自动下载失败时仍可浏览并指定已有 EXE。
 
-运行要求：Windows 10/11 x64、.NET Framework 4.8、`N_m3u8DL-RE.exe`、`ffmpeg.exe`。本地构建没有数字签名证书，Windows SmartScreen 可能显示“未知发布者”。
+运行要求：Windows 10/11 x64、.NET Framework 4.8。实际下载和混流仍需要 `N_m3u8DL-RE.exe` 与 `ffmpeg.exe`，可由 GUI 按需准备或手动指定。本地构建没有数字签名证书，Windows SmartScreen 可能显示“未知发布者”。
 
 ## 功能
 
@@ -26,7 +26,9 @@
 - 自动从 URL 推断名称；`index.m3u8` / `master.m3u8` 会使用有意义的父目录名。
 - 自动选择最佳视频、音频和字幕轨道，并默认混流为 MP4。
 - 自动查找 GUI 同目录、`tools`、`PATH`、WinGet，以及各固定磁盘根部的 `Downloads` / `Download` / `下载` 目录中的外部工具。
-- 正确显示下载器中文日志；取消整个进程树后清理该任务的专属下载分片临时目录。
+- 缺少工具时提供自动下载、手动浏览和暂不处理三种选择；自动下载固定版本并校验压缩包与最终 EXE。
+- 正确显示下载器中文日志，实时提取分片百分比，并把高频终端重绘压缩为可读的进度里程碑。
+- 取消整个进程树后清理该任务的专属下载分片临时目录。
 - 任务运行时禁用并灰显“密钥...”和“转换文件...”，结束后恢复。
 - 拒绝无法由外部程序访问的 `blob:chrome-extension://...`，支持粘贴猫抓导出的完整 `#EXTM3U` 正文。
 - 手动 HLS AES-128 KEY/IV：支持 32 位 HEX、16 字节 Base64 和密钥文件。
@@ -87,7 +89,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build.ps1
 生成发布 EXE、轻量 ZIP 和校验文件：
 
 ```powershell
-.\package.ps1 -Version 1.2.2
+.\package.ps1 -Version 1.2.3
 ```
 
 构建脚本会先编译并运行 `SelfTests.exe`，再生成 DPI 感知的 WinForms EXE。开发细节见 [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md)。

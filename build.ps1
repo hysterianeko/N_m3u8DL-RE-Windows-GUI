@@ -39,11 +39,14 @@ $commonArguments = @(
     "/reference:$framework\System.dll"
     "/reference:$framework\System.Core.dll"
     "/reference:$framework\System.Drawing.dll"
+    "/reference:$framework\System.IO.Compression.dll"
+    "/reference:$framework\System.IO.Compression.FileSystem.dll"
     "/reference:$framework\System.Windows.Forms.dll"
     "/reference:$framework\System.Web.dll"
     "/reference:$framework\System.Xml.dll"
     (Join-Path $projectDirectory 'Program.cs')
     (Join-Path $projectDirectory 'AppUtilities.cs')
+    (Join-Path $projectDirectory 'DependencyInstaller.cs')
     (Join-Path $projectDirectory 'MainForm.cs')
     (Join-Path $projectDirectory 'HlsKeyDialog.cs')
 )

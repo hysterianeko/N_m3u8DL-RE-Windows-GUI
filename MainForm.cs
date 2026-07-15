@@ -6,7 +6,10 @@ using System.Drawing;
 using System.IO;
 using System.Text;
 using System.Text.RegularExpressions;
+using System.Threading.Tasks;
 using System.Windows.Forms;
+using CancellationTokenSource = System.Threading.CancellationTokenSource;
+using SemaphoreSlim = System.Threading.SemaphoreSlim;
 
 namespace M3u8DownloaderGui
 {
@@ -25,10 +28,22 @@ namespace M3u8DownloaderGui
         private static readonly Color DisabledControlColor = Color.FromArgb(231, 235, 237);
         private static readonly Color DisabledTextColor = Color.FromArgb(132, 142, 149);
         private static readonly Color DisabledBorderColor = Color.FromArgb(203, 210, 214);
+        private static readonly Regex DownloaderLogPrefix = new Regex(
+            @"^(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{3})?[ \t]+" +
+            @"(?:TRACE|DEBUG|INFO|WARN|ERROR|FATAL)[ \t]*:[ \t]*",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+        private const int MaximumLogCharacters = 1000000;
 
         private readonly ToolTip _toolTip;
         private readonly UserSettings _settings;
+        private readonly bool _enableStartupDependencyPrompt;
         private readonly ConcurrentQueue<string> _pendingLogLines = new ConcurrentQueue<string>();
+        private readonly ConcurrentQueue<ExternalToolProgress> _pendingProgressUpdates =
+            new ConcurrentQueue<ExternalToolProgress>();
+        private readonly object _progressLogSync = new object();
+        private readonly SemaphoreSlim _dependencyWorkflowGate = new SemaphoreSlim(1, 1);
+        private readonly Dictionary<string, int> _progressLogBuckets =
+            new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
 
         private TextBox _urlTextBox;
         private TextBox _saveDirectoryTextBox;
@@ -60,6 +75,10 @@ namespace M3u8DownloaderGui
 
         private Process _activeProcess;
         private ProcessJob _processJob;
+        private Process _downloadOutputProcess;
+        private ProcessOutputPump _downloadOutputPump;
+        private ExternalToolOutputParser _downloadStandardOutputParser;
+        private ExternalToolOutputParser _downloadStandardErrorParser;
         private bool _isCancelling;
         private bool _updatingAutoName;
         private bool _fileNameWasEdited;
@@ -76,12 +95,27 @@ namespace M3u8DownloaderGui
         private string _downloadTemporaryDirectory;
         private readonly List<string> _secretRedactionValues = new List<string>();
         private OperationKind _activeOperation;
+        private DownloadPhase _downloadPhase;
         private string _activeOperationDirectory;
         private string _conversionFinalOutputPath;
         private string _conversionTemporaryOutputPath;
+        private bool _startupDependencyPromptShown;
+        private bool _toolDetectionInProgress;
+        private Task<string[]> _toolDetectionTask;
+        private bool _dependencyInstallInProgress;
+        private bool _closeRequestedDuringDependencyInstall;
+        private CancellationTokenSource _dependencyInstallCancellation;
+        private Task<DependencyInstallResult> _dependencyInstallTask;
+        private string _lastDependencyInstallStage;
 
         public MainForm()
+            : this(true)
         {
+        }
+
+        internal MainForm(bool enableStartupDependencyPrompt)
+        {
+            _enableStartupDependencyPrompt = enableStartupDependencyPrompt;
             _toolTip = new ToolTip();
             _toolTip.AutoPopDelay = 8000;
             _toolTip.InitialDelay = 450;
@@ -91,17 +125,17 @@ namespace M3u8DownloaderGui
 
             InitializeForm();
             BuildInterface();
-            WireEvents();
             ApplySettings();
+            WireEvents();
             ApplyCueBanners();
-            UpdateToolStatus();
+            SetToolStatusPending();
             UpdateKeyState();
             CleanupOldImportedPlaylists(GetImportedPlaylistDirectory());
             SecretFileStore.CleanupOldFiles();
 
             _logFlushTimer = new Timer();
             _logFlushTimer.Interval = 100;
-            _logFlushTimer.Tick += delegate { FlushPendingLogLines(); };
+            _logFlushTimer.Tick += delegate { FlushPendingOutput(); };
             _logFlushTimer.Start();
         }
 
@@ -175,10 +209,93 @@ namespace M3u8DownloaderGui
                 _keyOptionsButton.FlatAppearance.BorderColor == BorderColor &&
                 _startButton.Text == "开始下载";
 
+            Process smokeProcess = new Process();
+            _activeProcess = smokeProcess;
+            _activeOperation = OperationKind.Download;
+            _isCancelling = false;
+            ResetDownloadProgress();
+            SetRunningState(true);
+            _statusLabel.Text = "正在解析视频信息...";
+            UpdateStatusFromLog("16:00:00.000 WARN : 检测到特殊模式，将自动开启二进制合并");
+            bool mergeModeWarningDoesNotChangePhase =
+                _downloadPhase == DownloadPhase.Starting &&
+                _statusLabel.Text == "正在解析视频信息...";
+            UpdateStatusFromLog("16:00:00.001 INFO : 正在解析媒体信息...");
+            ExternalToolProgress smokeProgress = new ExternalToolProgress();
+            smokeProgress.StreamKind = "Vid";
+            smokeProgress.Current = 5;
+            smokeProgress.Total = 20;
+            smokeProgress.Percent = 25;
+            smokeProgress.DownloadedSize = "5.00MB";
+            smokeProgress.TotalSize = "20.00MB";
+            smokeProgress.Speed = "1.00MBps";
+            smokeProgress.RemainingTime = "00:00:15";
+            ApplyDownloadProgress(smokeProgress);
+            bool numericProgressIsVisible =
+                _downloadPhase == DownloadPhase.Downloading &&
+                _progressBar.Style == ProgressBarStyle.Blocks &&
+                _progressBar.Value == 25 &&
+                _statusLabel.Text.IndexOf("5/20", StringComparison.Ordinal) >= 0;
+            UpdateStatusFromLog("16:00:00.002 INFO : 二进制合并中...");
+            string mergingStatus = _statusLabel.Text;
+            ProgressBarStyle mergingStyle = _progressBar.Style;
+            smokeProgress.Current = 10;
+            smokeProgress.Percent = 50;
+            ApplyDownloadProgress(smokeProgress);
+            bool lateProgressDoesNotUndoMerging =
+                _downloadPhase == DownloadPhase.Merging &&
+                _statusLabel.Text == mergingStatus &&
+                _progressBar.Style == mergingStyle &&
+                mergingStyle == ProgressBarStyle.Marquee;
+            _downloadPhase = DownloadPhase.Parsing;
+            _isCancelling = true;
+            _statusLabel.Text = "正在取消任务...";
+            UpdateStatusFromLog("16:00:00.003 INFO : 二进制合并中...");
+            ApplyDownloadProgress(smokeProgress);
+            bool cancellationStatusHasPriority =
+                _statusLabel.Text == "正在取消任务..." &&
+                _downloadPhase == DownloadPhase.Parsing;
+
+            _activeProcess = null;
+            _isCancelling = false;
+            smokeProcess.Dispose();
+            SetRunningState(false);
+            ResetDownloadProgress();
+            ExternalToolProgress milestoneProgress = new ExternalToolProgress();
+            milestoneProgress.StreamKind = "Vid";
+            milestoneProgress.Total = 100;
+            milestoneProgress.Current = 1;
+            milestoneProgress.Percent = 1;
+            string firstMilestone = CreateProgressMilestone(milestoneProgress);
+            milestoneProgress.Current = 4;
+            milestoneProgress.Percent = 4;
+            string duplicateBucket = CreateProgressMilestone(milestoneProgress);
+            milestoneProgress.Current = 5;
+            milestoneProgress.Percent = 5;
+            string nextMilestone = CreateProgressMilestone(milestoneProgress);
+            milestoneProgress.Current = 100;
+            milestoneProgress.Percent = 100;
+            string completedMilestone = CreateProgressMilestone(milestoneProgress);
+            bool progressMilestonesAreDeduplicated =
+                !string.IsNullOrEmpty(firstMilestone) &&
+                string.IsNullOrEmpty(duplicateBucket) &&
+                !string.IsNullOrEmpty(nextMilestone) &&
+                string.IsNullOrEmpty(completedMilestone);
+
+            _logTextBox.Clear();
+            AppendLogCore(new string('A', 600000));
+            AppendLogCore(new string('B', 600000));
+            bool logLimitIsEnforced = _logTextBox.TextLength <= MaximumLogCharacters;
+            _logTextBox.Clear();
+            _statusLabel.Text = "就绪";
+
             return controlsExist && namingWorks && layoutIsStable &&
                    runningStateIsClear && idleStateIsRestored &&
                    configuredKeyIsDisabledClearly && configuredKeyStyleIsRestored &&
-                   clearedKeyStyleIsRestored;
+                   clearedKeyStyleIsRestored && mergeModeWarningDoesNotChangePhase &&
+                   numericProgressIsVisible && lateProgressDoesNotUndoMerging &&
+                   cancellationStatusHasPriority && progressMilestonesAreDeduplicated &&
+                   logLimitIsEnforced;
         }
 
         private void InitializeForm()
@@ -610,8 +727,8 @@ namespace M3u8DownloaderGui
             _urlTextBox.TextChanged += UrlTextBoxTextChanged;
             _urlTextBox.KeyDown += UrlTextBoxKeyDown;
             _fileNameTextBox.TextChanged += FileNameTextBoxTextChanged;
-            _downloaderPathTextBox.TextChanged += delegate { UpdateToolStatus(); };
-            _ffmpegPathTextBox.TextChanged += delegate { UpdateToolStatus(); };
+            _downloaderPathTextBox.TextChanged += delegate { SetToolStatusPending(); };
+            _ffmpegPathTextBox.TextChanged += delegate { SetToolStatusPending(); };
 
             _pasteButton.Click += PasteButtonClick;
             _browseDirectoryButton.Click += BrowseDirectoryButtonClick;
@@ -626,16 +743,15 @@ namespace M3u8DownloaderGui
             _convertFileButton.Click += ConvertFileButtonClick;
             _copyLogButton.Click += CopyLogButtonClick;
             _clearLogButton.Click += delegate { ClearLog(); };
+            Shown += MainFormShown;
             FormClosing += MainFormFormClosing;
         }
 
         private void ApplySettings()
         {
             _saveDirectoryTextBox.Text = _settings.SaveDirectory ?? string.Empty;
-            _downloaderPathTextBox.Text = ToolLocator.FindDownloader(_settings.DownloaderPath);
-            _ffmpegPathTextBox.Text = ToolLocator.FindFfmpeg(
-                _settings.FfmpegPath,
-                _downloaderPathTextBox.Text);
+            _downloaderPathTextBox.Text = _settings.DownloaderPath ?? string.Empty;
+            _ffmpegPathTextBox.Text = _settings.FfmpegPath ?? string.Empty;
             _muxToMp4CheckBox.Checked = _settings.MuxToMp4;
             _openFolderWhenDoneCheckBox.Checked = _settings.OpenFolderWhenDone;
         }
@@ -860,10 +976,13 @@ namespace M3u8DownloaderGui
         {
             string path = BrowseExecutable(
                 "选择 N_m3u8DL-RE.exe",
-                "N_m3u8DL-RE|N_m3u8DL-RE.exe|可执行程序|*.exe");
+                "N_m3u8DL-RE|N_m3u8DL-RE.exe|可执行程序|*.exe",
+                "N_m3u8DL-RE.exe");
             if (path != null)
             {
                 _downloaderPathTextBox.Text = path;
+                UpdateToolStatus();
+                SaveCurrentSettings();
             }
         }
 
@@ -871,14 +990,17 @@ namespace M3u8DownloaderGui
         {
             string path = BrowseExecutable(
                 "选择 ffmpeg.exe",
-                "FFmpeg|ffmpeg.exe|可执行程序|*.exe");
+                "FFmpeg|ffmpeg.exe|可执行程序|*.exe",
+                "ffmpeg.exe");
             if (path != null)
             {
                 _ffmpegPathTextBox.Text = path;
+                UpdateToolStatus();
+                SaveCurrentSettings();
             }
         }
 
-        private string BrowseExecutable(string title, string filter)
+        private string BrowseExecutable(string title, string filter, string expectedFileName)
         {
             using (OpenFileDialog dialog = new OpenFileDialog())
             {
@@ -886,36 +1008,509 @@ namespace M3u8DownloaderGui
                 dialog.Filter = filter;
                 dialog.CheckFileExists = true;
                 dialog.Multiselect = false;
-                return dialog.ShowDialog(this) == DialogResult.OK ? dialog.FileName : null;
+                if (dialog.ShowDialog(this) != DialogResult.OK)
+                {
+                    return null;
+                }
+
+                string selectedPath = dialog.FileName;
+                if (!string.Equals(
+                    Path.GetFileName(selectedPath),
+                    expectedFileName,
+                    StringComparison.OrdinalIgnoreCase))
+                {
+                    ShowError("请选择名为 " + expectedFileName + " 的程序文件。");
+                    return null;
+                }
+
+                try
+                {
+                    using (FileStream stream = new FileStream(
+                        selectedPath,
+                        FileMode.Open,
+                        FileAccess.Read,
+                        FileShare.ReadWrite | FileShare.Delete))
+                    {
+                        if (stream.Length <= 0)
+                        {
+                            ShowError(expectedFileName + " 是空文件，无法使用。");
+                            return null;
+                        }
+                    }
+                }
+                catch (Exception exception)
+                {
+                    ShowError("无法读取所选程序：" + exception.Message);
+                    return null;
+                }
+
+                return selectedPath;
             }
         }
 
-        private void DetectToolsButtonClick(object sender, EventArgs e)
+        private async void DetectToolsButtonClick(object sender, EventArgs e)
         {
-            string downloader = ToolLocator.FindDownloader(_downloaderPathTextBox.Text);
-            string ffmpeg = ToolLocator.FindFfmpeg(_ffmpegPathTextBox.Text, downloader);
-            _downloaderPathTextBox.Text = downloader;
-            _ffmpegPathTextBox.Text = ffmpeg;
-            UpdateToolStatus();
+            await PromptForMissingToolsAsync(true, true);
+        }
 
-            bool downloaderReady = ToolLocator.IsUsableExecutable(downloader);
-            bool ffmpegReady = ToolLocator.IsUsableExecutable(ffmpeg);
-            if (downloaderReady && ffmpegReady)
+        private async void MainFormShown(object sender, EventArgs e)
+        {
+            Shown -= MainFormShown;
+            if (!_enableStartupDependencyPrompt || _startupDependencyPromptShown)
             {
-                _statusLabel.Text = "已找到下载程序和 FFmpeg";
+                return;
             }
-            else if (!downloaderReady && !ffmpegReady)
+
+            _startupDependencyPromptShown = true;
+            SetToolDetectionState(true);
+            await Task.Yield();
+            if (!IsDisposed && !Disposing && _activeProcess == null)
             {
-                _statusLabel.Text = "未找到 N_m3u8DL-RE.exe 和 ffmpeg.exe";
+                await PromptForMissingToolsAsync(true, true);
             }
-            else if (!downloaderReady)
+            if (!IsDisposed && !Disposing &&
+                !_toolDetectionInProgress &&
+                !_dependencyInstallInProgress &&
+                _activeProcess == null)
             {
-                _statusLabel.Text = "未找到 N_m3u8DL-RE.exe；请检查下载程序路径";
+                SetToolDetectionState(false);
+            }
+        }
+
+        private async Task<bool> ResolveAndApplyToolPathsAsync()
+        {
+            if (IsDisposed || Disposing)
+            {
+                return false;
+            }
+
+            Task<string[]> detectionTask = _toolDetectionTask;
+            bool ownsDetection = detectionTask == null;
+            if (ownsDetection)
+            {
+                _toolDetectionInProgress = true;
+                SetToolDetectionState(true);
+                _statusLabel.Text = "正在检测外部工具...";
+                string preferredDownloader = _downloaderPathTextBox.Text;
+                string preferredFfmpeg = _ffmpegPathTextBox.Text;
+                detectionTask = Task.Run(
+                    delegate
+                    {
+                        string downloader = ToolLocator.FindDownloader(preferredDownloader);
+                        string ffmpeg = ToolLocator.FindFfmpeg(preferredFfmpeg, downloader);
+                        return new[] { downloader, ffmpeg };
+                    });
+                _toolDetectionTask = detectionTask;
+            }
+
+            try
+            {
+                string[] resolvedPaths = await detectionTask;
+
+                if (IsDisposed || Disposing)
+                {
+                    return false;
+                }
+
+                _downloaderPathTextBox.Text = resolvedPaths[0];
+                _ffmpegPathTextBox.Text = resolvedPaths[1];
+                UpdateToolStatus();
+                return true;
+            }
+            catch (Exception exception)
+            {
+                if (!IsDisposed && !Disposing)
+                {
+                    _statusLabel.Text = "检测外部工具失败";
+                    AppendLog("[GUI] 检测外部工具失败：" + exception.Message);
+                }
+                return false;
+            }
+            finally
+            {
+                if (ownsDetection && ReferenceEquals(_toolDetectionTask, detectionTask))
+                {
+                    _toolDetectionTask = null;
+                    _toolDetectionInProgress = false;
+                    if (!IsDisposed && !Disposing)
+                    {
+                        SetToolDetectionState(false);
+                    }
+                }
+            }
+        }
+
+        private async Task<bool> PromptForMissingToolsAsync(
+            bool requireDownloader,
+            bool requireFfmpeg)
+        {
+            await _dependencyWorkflowGate.WaitAsync();
+            try
+            {
+                return await RunMissingToolsWorkflowAsync(
+                    requireDownloader,
+                    requireFfmpeg);
+            }
+            finally
+            {
+                _dependencyWorkflowGate.Release();
+            }
+        }
+
+        private async Task<bool> RunMissingToolsWorkflowAsync(
+            bool requireDownloader,
+            bool requireFfmpeg)
+        {
+            if (_dependencyInstallInProgress || _activeProcess != null || IsDisposed || Disposing)
+            {
+                return false;
+            }
+
+            if (!await ResolveAndApplyToolPathsAsync())
+            {
+                return false;
+            }
+
+            bool missingDownloader = requireDownloader &&
+                !ToolLocator.IsUsableExecutable(_downloaderPathTextBox.Text);
+            bool missingFfmpeg = requireFfmpeg &&
+                !ToolLocator.IsUsableExecutable(_ffmpegPathTextBox.Text);
+            if (!missingDownloader && !missingFfmpeg)
+            {
+                _statusLabel.Text = requireDownloader
+                    ? "已找到下载程序和 FFmpeg"
+                    : "已找到 FFmpeg";
+                SaveCurrentSettings();
+                return true;
+            }
+
+            string missingText = GetMissingToolsText(missingDownloader, missingFfmpeg);
+            string downloadSize = missingDownloader && missingFfmpeg
+                ? "通常需要下载约 38 MB"
+                : (missingDownloader ? "需要下载约 5 MB" : "通常需要下载约 32 MB");
+            DialogResult choice = MessageBox.Show(
+                this,
+                "未检测到：" + missingText + "\r\n\r\n" +
+                "是否使用当前网络直连 GitHub Release 自动下载？" + downloadSize + "。\r\n" +
+                "GUI 不会使用 Windows 系统代理。\r\n" +
+                "下载完成后会校验 SHA-256，再保存到当前用户的应用数据目录。\r\n\r\n" +
+                "选择“是”：自动下载\r\n" +
+                "选择“否”：浏览并指定电脑中已有的程序\r\n" +
+                "选择“取消”：暂不处理",
+                "缺少外部工具",
+                MessageBoxButtons.YesNoCancel,
+                MessageBoxIcon.Question,
+                MessageBoxDefaultButton.Button1);
+
+            if (choice == DialogResult.Yes)
+            {
+                await InstallMissingDependenciesAsync(missingDownloader, missingFfmpeg);
+            }
+            else if (choice == DialogResult.No)
+            {
+                await BrowseForMissingToolsAsync(
+                    missingDownloader,
+                    missingFfmpeg,
+                    requireDownloader,
+                    requireFfmpeg);
             }
             else
             {
-                _statusLabel.Text = "未找到 ffmpeg.exe；请检查 FFmpeg 路径";
+                _statusLabel.Text = "缺少外部工具；可随时点击“自动检测”重试";
             }
+
+            if (IsDisposed || Disposing)
+            {
+                return false;
+            }
+            return AreRequiredToolsReady(requireDownloader, requireFfmpeg);
+        }
+
+        private static string GetMissingToolsText(bool missingDownloader, bool missingFfmpeg)
+        {
+            if (missingDownloader && missingFfmpeg)
+            {
+                return "N_m3u8DL-RE.exe 和 ffmpeg.exe";
+            }
+            return missingDownloader ? "N_m3u8DL-RE.exe" : "ffmpeg.exe";
+        }
+
+        private async Task BrowseForMissingToolsAsync(
+            bool missingDownloader,
+            bool missingFfmpeg,
+            bool requireDownloader,
+            bool requireFfmpeg)
+        {
+            if (missingDownloader)
+            {
+                string downloader = BrowseExecutable(
+                    "选择 N_m3u8DL-RE.exe",
+                    "N_m3u8DL-RE|N_m3u8DL-RE.exe|可执行程序|*.exe",
+                    "N_m3u8DL-RE.exe");
+                if (downloader != null)
+                {
+                    _downloaderPathTextBox.Text = downloader;
+                }
+            }
+
+            if (missingFfmpeg)
+            {
+                string ffmpeg = BrowseExecutable(
+                    "选择 ffmpeg.exe",
+                    "FFmpeg|ffmpeg.exe|可执行程序|*.exe",
+                    "ffmpeg.exe");
+                if (ffmpeg != null)
+                {
+                    _ffmpegPathTextBox.Text = ffmpeg;
+                }
+            }
+
+            await ResolveAndApplyToolPathsAsync();
+            if (IsDisposed || Disposing)
+            {
+                return;
+            }
+            SaveCurrentSettings();
+            bool ready = AreRequiredToolsReady(requireDownloader, requireFfmpeg);
+            _statusLabel.Text = ready
+                ? "所需工具已就绪"
+                : "所需工具仍未找到；可点击“自动检测”重试";
+        }
+
+        private bool AreRequiredToolsReady(bool requireDownloader, bool requireFfmpeg)
+        {
+            return (!requireDownloader ||
+                    ToolLocator.IsUsableExecutable(_downloaderPathTextBox.Text)) &&
+                (!requireFfmpeg ||
+                    ToolLocator.IsUsableExecutable(_ffmpegPathTextBox.Text));
+        }
+
+        private async Task InstallMissingDependenciesAsync(
+            bool installDownloader,
+            bool installFfmpeg)
+        {
+            if (_dependencyInstallInProgress)
+            {
+                return;
+            }
+
+            _dependencyInstallInProgress = true;
+            _closeRequestedDuringDependencyInstall = false;
+            _lastDependencyInstallStage = string.Empty;
+            _dependencyInstallCancellation = new CancellationTokenSource();
+            SetRunningState(true);
+            _progressBar.Style = ProgressBarStyle.Blocks;
+            _progressBar.MarqueeAnimationSpeed = 0;
+            _progressBar.Value = 0;
+            _statusLabel.Text = "正在准备下载外部工具...";
+            AppendLog(string.Empty);
+            AppendLog("[GUI] 开始直连 GitHub Release 下载缺失工具；未使用 Windows 系统代理。");
+
+            bool offerManualBrowse = false;
+            bool installationCancelled = false;
+            bool installationSucceeded = false;
+            Exception installationFailure = null;
+            DependencyInstallResult result = null;
+            try
+            {
+                try
+                {
+                    Progress<DependencyInstallProgress> progress =
+                        new Progress<DependencyInstallProgress>(UpdateDependencyInstallProgress);
+                    _dependencyInstallTask = DependencyInstaller.InstallAsync(
+                        installDownloader,
+                        installFfmpeg,
+                        progress,
+                        _dependencyInstallCancellation.Token);
+                    result = await _dependencyInstallTask;
+                    installationSucceeded = true;
+                }
+                catch (OperationCanceledException)
+                {
+                    installationCancelled = true;
+                }
+                catch (Exception exception)
+                {
+                    installationFailure = exception;
+                }
+
+                if (_closeRequestedDuringDependencyInstall || IsDisposed || Disposing)
+                {
+                    if (installationFailure != null)
+                    {
+                        AppendLog("[GUI] 关闭窗口时工具下载已停止：" +
+                            installationFailure.Message);
+                    }
+                }
+                else
+                {
+                    ApplyInstalledDependencyPaths(result, installDownloader, installFfmpeg);
+                    if (!IsDisposed && !Disposing)
+                    {
+                        SaveCurrentSettings();
+                        if (installationSucceeded)
+                        {
+                            _progressBar.Style = ProgressBarStyle.Blocks;
+                            _progressBar.Value = 100;
+                            _statusLabel.Text = "工具下载完成";
+                            AppendLog("[GUI] 外部工具下载并校验完成。");
+                        }
+                        else if (installationCancelled)
+                        {
+                            bool requestedToolReady =
+                                (installDownloader && ToolLocator.IsUsableExecutable(
+                                    _downloaderPathTextBox.Text)) ||
+                                (installFfmpeg && ToolLocator.IsUsableExecutable(
+                                    _ffmpegPathTextBox.Text));
+                            _statusLabel.Text = requestedToolReady
+                                ? "工具下载已取消；已完成的工具已保留"
+                                : "工具下载已取消";
+                            AppendLog("[GUI] 工具下载已取消。");
+                        }
+                        else if (installationFailure != null)
+                        {
+                            _statusLabel.Text = "工具自动下载失败";
+                            AppendLog("[GUI] 工具自动下载失败：" + installationFailure.Message);
+                            ShowError(
+                                "自动下载工具失败：\r\n\r\n" + installationFailure.Message +
+                                "\r\n\r\n请确认当前网络可以直接访问 GitHub；GUI 不会使用 Windows 系统代理。" +
+                                "也可以手动浏览选择已有程序。");
+                            offerManualBrowse = true;
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                if (_dependencyInstallCancellation != null)
+                {
+                    _dependencyInstallCancellation.Dispose();
+                    _dependencyInstallCancellation = null;
+                }
+                _dependencyInstallTask = null;
+                _dependencyInstallInProgress = false;
+                SetRunningState(false);
+                if (!installationSucceeded)
+                {
+                    ResetDownloadProgress();
+                }
+                UpdateToolStatus();
+            }
+
+            if (_closeRequestedDuringDependencyInstall)
+            {
+                _closeRequestedDuringDependencyInstall = false;
+                Close();
+                return;
+            }
+
+            if (offerManualBrowse)
+            {
+                bool missingDownloader = installDownloader &&
+                    !ToolLocator.IsUsableExecutable(_downloaderPathTextBox.Text);
+                bool missingFfmpeg = installFfmpeg &&
+                    !ToolLocator.IsUsableExecutable(_ffmpegPathTextBox.Text);
+                DialogResult browse = MessageBox.Show(
+                    this,
+                    "是否现在浏览并选择电脑中已有的工具？",
+                    "改用手动选择",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Question,
+                    MessageBoxDefaultButton.Button1);
+                if (browse == DialogResult.Yes)
+                {
+                    await BrowseForMissingToolsAsync(
+                        missingDownloader,
+                        missingFfmpeg,
+                        installDownloader,
+                        installFfmpeg);
+                }
+            }
+        }
+
+        private void ApplyInstalledDependencyPaths(
+            DependencyInstallResult result,
+            bool installDownloader,
+            bool installFfmpeg)
+        {
+            if (result != null && !string.IsNullOrWhiteSpace(result.DownloaderPath))
+            {
+                _downloaderPathTextBox.Text = result.DownloaderPath;
+            }
+            if (result != null && !string.IsNullOrWhiteSpace(result.FfmpegPath))
+            {
+                _ffmpegPathTextBox.Text = result.FfmpegPath;
+            }
+
+            string managedDirectory = ToolLocator.GetManagedToolsDirectory();
+            string managedDownloader = Path.Combine(managedDirectory, "N_m3u8DL-RE.exe");
+            string managedFfmpeg = Path.Combine(managedDirectory, "ffmpeg.exe");
+            if (installDownloader && ToolLocator.IsUsableExecutable(managedDownloader))
+            {
+                _downloaderPathTextBox.Text = managedDownloader;
+            }
+            if (installFfmpeg && ToolLocator.IsUsableExecutable(managedFfmpeg))
+            {
+                _ffmpegPathTextBox.Text = managedFfmpeg;
+            }
+        }
+
+        private void UpdateDependencyInstallProgress(DependencyInstallProgress progress)
+        {
+            if (!_dependencyInstallInProgress ||
+                progress == null ||
+                IsDisposed ||
+                Disposing ||
+                (_dependencyInstallCancellation != null &&
+                 _dependencyInstallCancellation.IsCancellationRequested))
+            {
+                return;
+            }
+
+            string stageKey = (progress.ToolName ?? string.Empty) + "|" +
+                (progress.Stage ?? string.Empty);
+            if (!string.Equals(
+                stageKey,
+                _lastDependencyInstallStage,
+                StringComparison.Ordinal))
+            {
+                _lastDependencyInstallStage = stageKey;
+                AppendLog("[GUI] " + progress.ToolName + "：" + progress.Stage);
+            }
+
+            if (progress.TotalBytes > 0)
+            {
+                double ratio = Math.Max(
+                    0,
+                    Math.Min(1, progress.BytesReceived / (double)progress.TotalBytes));
+                int percent = Math.Min(99, (int)Math.Floor(ratio * 100));
+                _progressBar.MarqueeAnimationSpeed = 0;
+                _progressBar.Style = ProgressBarStyle.Blocks;
+                _progressBar.Value = percent;
+                _statusLabel.Text =
+                    progress.Stage + " " + progress.ToolName + " " + percent + "%  " +
+                    FormatByteCount(progress.BytesReceived) + "/" +
+                    FormatByteCount(progress.TotalBytes);
+            }
+            else
+            {
+                _progressBar.Style = ProgressBarStyle.Marquee;
+                _progressBar.MarqueeAnimationSpeed = 28;
+                _statusLabel.Text = progress.Stage + " " + progress.ToolName + "...";
+            }
+        }
+
+        private static string FormatByteCount(long bytes)
+        {
+            if (bytes >= 1024L * 1024L)
+            {
+                return (bytes / (1024d * 1024d)).ToString("0.0") + " MB";
+            }
+            if (bytes >= 1024L)
+            {
+                return (bytes / 1024d).ToString("0.0") + " KB";
+            }
+            return Math.Max(0, bytes) + " B";
         }
 
         private void UpdateToolStatus()
@@ -946,8 +1541,28 @@ namespace M3u8DownloaderGui
             }
         }
 
-        private void StartButtonClick(object sender, EventArgs e)
+        private void SetToolStatusPending()
         {
+            if (_downloaderPathTextBox == null || _ffmpegPathTextBox == null || _toolStatusLabel == null)
+            {
+                return;
+            }
+
+            _downloaderPathTextBox.BackColor = ValidColor;
+            _ffmpegPathTextBox.BackColor = ValidColor;
+            _toolStatusLabel.Text = _toolDetectionInProgress
+                ? "正在检测工具"
+                : "等待检测工具";
+            _toolStatusLabel.ForeColor = MutedTextColor;
+        }
+
+        private async void StartButtonClick(object sender, EventArgs e)
+        {
+            if (!await PromptForMissingToolsAsync(true, true))
+            {
+                return;
+            }
+
             DownloadRequest request;
             if (!TryCreateRequest(out request))
             {
@@ -1000,8 +1615,13 @@ namespace M3u8DownloaderGui
                 hasKey ? "已设置手动 HLS 密钥；不会保存到配置文件" : "设置可选的 HLS AES-128 密钥和 IV");
         }
 
-        private void ConvertFileButtonClick(object sender, EventArgs e)
+        private async void ConvertFileButtonClick(object sender, EventArgs e)
         {
+            if (!await PromptForMissingToolsAsync(false, true))
+            {
+                return;
+            }
+
             string sourcePath;
             using (OpenFileDialog sourceDialog = new OpenFileDialog())
             {
@@ -1137,7 +1757,7 @@ namespace M3u8DownloaderGui
 
             Process process = new Process();
             process.StartInfo = startInfo;
-            process.EnableRaisingEvents = true;
+            process.EnableRaisingEvents = false;
             process.OutputDataReceived += ProcessOutputDataReceived;
             process.ErrorDataReceived += ProcessErrorDataReceived;
             process.Exited += ProcessExited;
@@ -1159,6 +1779,7 @@ namespace M3u8DownloaderGui
             _statusLabel.Text = "正在启动 FFmpeg...";
 
             bool processStarted = false;
+            bool exitMonitoringEnabled = false;
             try
             {
                 if (!process.Start())
@@ -1182,6 +1803,8 @@ namespace M3u8DownloaderGui
 
                 process.BeginOutputReadLine();
                 process.BeginErrorReadLine();
+                process.EnableRaisingEvents = true;
+                exitMonitoringEnabled = true;
                 _statusLabel.Text = "正在无损转换为 MP4...";
             }
             catch (Exception exception)
@@ -1190,6 +1813,18 @@ namespace M3u8DownloaderGui
                 bool processStopped = !processStarted || StopProcessForCleanup(process, 5000);
                 if (!processStopped)
                 {
+                    if (!exitMonitoringEnabled)
+                    {
+                        try
+                        {
+                            process.EnableRaisingEvents = true;
+                            exitMonitoringEnabled = true;
+                        }
+                        catch
+                        {
+                        }
+                    }
+
                     _isCancelling = true;
                     _statusLabel.Text = "FFmpeg 启动异常，正在等待进程退出";
                     AppendLog("[GUI] 无法确认 FFmpeg 已退出；保留临时文件并维持取消状态。");
@@ -1200,11 +1835,7 @@ namespace M3u8DownloaderGui
                 }
 
                 _activeProcess = null;
-                if (_processJob != null)
-                {
-                    _processJob.Dispose();
-                    _processJob = null;
-                }
+                DisposeProcessJob();
 
                 process.Dispose();
                 SetRunningState(false);
@@ -1453,10 +2084,7 @@ namespace M3u8DownloaderGui
 
             Process process = new Process();
             process.StartInfo = startInfo;
-            process.EnableRaisingEvents = true;
-            process.OutputDataReceived += ProcessOutputDataReceived;
-            process.ErrorDataReceived += ProcessErrorDataReceived;
-            process.Exited += ProcessExited;
+            process.EnableRaisingEvents = false;
 
             _isCancelling = false;
             _activeOperation = OperationKind.Download;
@@ -1466,6 +2094,7 @@ namespace M3u8DownloaderGui
             _downloadStartedUtc = DateTime.UtcNow;
             _filesBeforeDownload = CaptureFileState(request.SaveDirectory);
             _activeProcess = process;
+            ResetDownloadProgress();
             SetRunningState(true);
 
             AppendLog(string.Empty);
@@ -1475,6 +2104,7 @@ namespace M3u8DownloaderGui
             _statusLabel.Text = "正在启动下载程序...";
 
             bool processStarted = false;
+            bool exitMonitoringEnabled = false;
             try
             {
                 if (!process.Start())
@@ -1482,6 +2112,7 @@ namespace M3u8DownloaderGui
                     throw new InvalidOperationException("下载程序没有成功启动。");
                 }
                 processStarted = true;
+                StartDownloadOutputCapture(process);
 
                 ProcessJob job = ProcessJob.TryCreateKillOnClose();
                 if (job != null)
@@ -1496,9 +2127,10 @@ namespace M3u8DownloaderGui
                     }
                 }
 
-                process.BeginOutputReadLine();
-                process.BeginErrorReadLine();
-                _statusLabel.Text = "正在解析视频信息...";
+                process.Exited += ProcessExited;
+                process.EnableRaisingEvents = true;
+                exitMonitoringEnabled = true;
+                AdvanceDownloadPhase(DownloadPhase.Parsing, "正在解析视频信息...");
             }
             catch (Exception exception)
             {
@@ -1506,6 +2138,20 @@ namespace M3u8DownloaderGui
                 bool processStopped = !processStarted || StopProcessForCleanup(process, 5000);
                 if (!processStopped)
                 {
+                    if (!exitMonitoringEnabled)
+                    {
+                        try
+                        {
+                            process.Exited -= ProcessExited;
+                            process.Exited += ProcessExited;
+                            process.EnableRaisingEvents = true;
+                            exitMonitoringEnabled = true;
+                        }
+                        catch
+                        {
+                        }
+                    }
+
                     _isCancelling = true;
                     _statusLabel.Text = "下载程序启动异常，正在等待进程退出";
                     AppendLog("[GUI] 无法确认下载进程已退出；保留临时文件并维持取消状态。");
@@ -1515,12 +2161,10 @@ namespace M3u8DownloaderGui
                     return;
                 }
 
+                WaitForDownloadOutputCapture(process);
+                ClearDownloadOutputCapture(process);
                 _activeProcess = null;
-                if (_processJob != null)
-                {
-                    _processJob.Dispose();
-                    _processJob = null;
-                }
+                DisposeProcessJob();
                 try
                 {
                     process.Dispose();
@@ -1622,6 +2266,77 @@ namespace M3u8DownloaderGui
             }
         }
 
+        private void StartDownloadOutputCapture(Process process)
+        {
+            ExternalToolOutputParser standardOutputParser = new ExternalToolOutputParser(
+                HandleDownloaderLogRecord,
+                QueueDownloadProgress);
+            ExternalToolOutputParser standardErrorParser = new ExternalToolOutputParser(
+                HandleDownloaderLogRecord,
+                QueueDownloadProgress);
+            ProcessOutputPump pump = new ProcessOutputPump(
+                process.StandardOutput,
+                process.StandardError,
+                standardOutputParser.Append,
+                standardErrorParser.Append,
+                standardOutputParser.Complete,
+                standardErrorParser.Complete);
+
+            _downloadOutputProcess = process;
+            _downloadStandardOutputParser = standardOutputParser;
+            _downloadStandardErrorParser = standardErrorParser;
+            _downloadOutputPump = pump;
+            pump.Start();
+        }
+
+        private void HandleDownloaderLogRecord(string record)
+        {
+            AppendLog(RedactSecrets(record));
+        }
+
+        private void QueueDownloadProgress(ExternalToolProgress progress)
+        {
+            if (progress != null && !_isCancelling && _downloadPhase < DownloadPhase.Merging)
+            {
+                string milestone = CreateProgressMilestone(progress);
+                if (!string.IsNullOrEmpty(milestone))
+                {
+                    AppendLog(milestone);
+                }
+
+                _pendingProgressUpdates.Enqueue(progress);
+            }
+        }
+
+        private bool WaitForDownloadOutputCapture(Process process)
+        {
+            ProcessOutputPump pump = ReferenceEquals(process, _downloadOutputProcess)
+                ? _downloadOutputPump
+                : null;
+            if (pump == null || pump.WaitForCompletion(5000))
+            {
+                return true;
+            }
+
+            pump.Stop();
+            pump.WaitForCompletion(1000);
+            AppendLog("[GUI] 警告：下载器输出管道未及时关闭，尾部日志可能不完整。");
+            return false;
+        }
+
+        private void ClearDownloadOutputCapture(Process process)
+        {
+            if (!ReferenceEquals(process, _downloadOutputProcess))
+            {
+                return;
+            }
+
+            _downloadOutputProcess = null;
+            _downloadOutputPump = null;
+            _downloadStandardOutputParser = null;
+            _downloadStandardErrorParser = null;
+        }
+
         private void ProcessOutputDataReceived(object sender, DataReceivedEventArgs e)
         {
             if (e.Data != null)
@@ -1683,9 +2398,22 @@ namespace M3u8DownloaderGui
             }
 
             int exitCode = -1;
+            if (ReferenceEquals(completedProcess, _activeProcess))
+            {
+                DisposeProcessJob();
+            }
+
             try
             {
                 completedProcess.WaitForExit();
+            }
+            catch
+            {
+            }
+
+            WaitForDownloadOutputCapture(completedProcess);
+            try
+            {
                 exitCode = completedProcess.ExitCode;
             }
             catch
@@ -1711,6 +2439,9 @@ namespace M3u8DownloaderGui
             string saveDirectory = string.IsNullOrWhiteSpace(_activeOperationDirectory)
                 ? _saveDirectoryTextBox.Text.Trim()
                 : _activeOperationDirectory;
+            WaitForDownloadOutputCapture(completedProcess);
+            FlushPendingOutput();
+            ClearDownloadOutputCapture(completedProcess);
             _activeProcess = null;
             _isCancelling = false;
             _activeOperationDirectory = null;
@@ -1719,11 +2450,7 @@ namespace M3u8DownloaderGui
                 FlushPendingLogLines();
             }
 
-            if (_processJob != null)
-            {
-                _processJob.Dispose();
-                _processJob = null;
-            }
+            DisposeProcessJob();
 
             try
             {
@@ -1858,6 +2585,12 @@ namespace M3u8DownloaderGui
             AppendLogCore(line);
         }
 
+        private void FlushPendingOutput()
+        {
+            FlushPendingLogLines();
+            FlushPendingProgressUpdates();
+        }
+
         private void FlushPendingLogLines()
         {
             if (IsDisposed || Disposing || _logTextBox == null)
@@ -1881,13 +2614,7 @@ namespace M3u8DownloaderGui
                 return;
             }
 
-            if (_logTextBox.TextLength > 1000000)
-            {
-                _logTextBox.Select(0, 200000);
-                _logTextBox.SelectedText = string.Empty;
-            }
-
-            _logTextBox.AppendText(batch.ToString());
+            AppendTextToLog(batch.ToString());
             _logTextBox.SelectionStart = _logTextBox.TextLength;
             _logTextBox.ScrollToCaret();
             foreach (string statusLine in statusLines)
@@ -1898,43 +2625,243 @@ namespace M3u8DownloaderGui
 
         private void AppendLogCore(string line)
         {
-            if (_logTextBox.TextLength > 1000000)
-            {
-                _logTextBox.Select(0, 200000);
-                _logTextBox.SelectedText = string.Empty;
-            }
-
-            _logTextBox.AppendText((line ?? string.Empty) + Environment.NewLine);
+            AppendTextToLog((line ?? string.Empty) + Environment.NewLine);
             _logTextBox.SelectionStart = _logTextBox.TextLength;
             _logTextBox.ScrollToCaret();
             UpdateStatusFromLog(line);
         }
 
-        private void UpdateStatusFromLog(string line)
+        private void AppendTextToLog(string text)
         {
-            if (string.IsNullOrWhiteSpace(line) || _activeProcess == null)
+            if (string.IsNullOrEmpty(text))
             {
                 return;
             }
 
-            if (line.IndexOf("开始下载", StringComparison.OrdinalIgnoreCase) >= 0)
+            if (text.Length > MaximumLogCharacters)
             {
-                _statusLabel.Text = "正在下载视频分片...";
+                text = text.Substring(text.Length - MaximumLogCharacters);
+                int firstNewline = text.IndexOf('\n');
+                if (firstNewline >= 0 && firstNewline + 1 < text.Length)
+                {
+                    text = text.Substring(firstNewline + 1);
+                }
             }
-            else if (line.IndexOf("合并", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                     line.IndexOf("混流", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                     line.IndexOf("mux", StringComparison.OrdinalIgnoreCase) >= 0)
+
+            int excess = _logTextBox.TextLength + text.Length - MaximumLogCharacters;
+            if (excess > 0 && _logTextBox.TextLength > 0)
             {
-                _statusLabel.Text = "正在合并媒体文件...";
+                string existing = _logTextBox.Text;
+                int removeLength = Math.Min(existing.Length, excess);
+                int newline = existing.IndexOf('\n', removeLength);
+                if (newline >= 0)
+                {
+                    removeLength = newline + 1;
+                }
+                else
+                {
+                    removeLength = existing.Length;
+                }
+
+                _logTextBox.Select(0, removeLength);
+                _logTextBox.SelectedText = string.Empty;
             }
-            else if (line.IndexOf("正在解析", StringComparison.OrdinalIgnoreCase) >= 0)
+
+            _logTextBox.AppendText(text);
+        }
+
+        private void ResetDownloadProgress()
+        {
+            ExternalToolProgress ignored;
+            while (_pendingProgressUpdates.TryDequeue(out ignored))
             {
-                _statusLabel.Text = "正在解析媒体信息...";
+            }
+
+            lock (_progressLogSync)
+            {
+                _progressLogBuckets.Clear();
+            }
+            _downloadPhase = DownloadPhase.Starting;
+            _progressBar.Value = 0;
+        }
+
+        private void FlushPendingProgressUpdates()
+        {
+            ExternalToolProgress progress;
+            int count = 0;
+            while (count < 500 && _pendingProgressUpdates.TryDequeue(out progress))
+            {
+                ApplyDownloadProgress(progress);
+                count++;
+            }
+        }
+
+        private void ApplyDownloadProgress(ExternalToolProgress progress)
+        {
+            if (progress == null || _activeProcess == null ||
+                _activeOperation != OperationKind.Download || _isCancelling ||
+                _downloadPhase >= DownloadPhase.Merging)
+            {
+                return;
+            }
+
+            AdvanceDownloadPhase(DownloadPhase.Downloading, null);
+            string streamKind = string.IsNullOrWhiteSpace(progress.StreamKind)
+                ? "Vid"
+                : progress.StreamKind;
+            int displayedPercent = Math.Max(0, Math.Min(99, (int)Math.Round(progress.Percent)));
+            _progressBar.MarqueeAnimationSpeed = 0;
+            _progressBar.Style = ProgressBarStyle.Blocks;
+            _progressBar.Value = displayedPercent;
+
+            string streamLabel = GetProgressStreamLabel(streamKind);
+            StringBuilder status = new StringBuilder();
+            status.Append("正在下载");
+            status.Append(streamLabel);
+            status.Append("：");
+            status.Append(progress.Current);
+            status.Append('/');
+            status.Append(progress.Total);
+            status.Append(" (");
+            status.Append(progress.Percent.ToString("0.00"));
+            status.Append("%)");
+            if (!string.IsNullOrWhiteSpace(progress.DownloadedSize))
+            {
+                status.Append("  ");
+                status.Append(progress.DownloadedSize);
+                if (!string.IsNullOrWhiteSpace(progress.TotalSize))
+                {
+                    status.Append('/');
+                    status.Append(progress.TotalSize);
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(progress.Speed) && progress.Speed != "-")
+            {
+                status.Append("  ");
+                status.Append(progress.Speed);
+            }
+
+            if (!string.IsNullOrWhiteSpace(progress.RemainingTime))
+            {
+                status.Append("  剩余 ");
+                status.Append(progress.RemainingTime);
+            }
+
+            _statusLabel.Text = status.ToString();
+        }
+
+        private string CreateProgressMilestone(ExternalToolProgress progress)
+        {
+            if (progress.Percent >= 100)
+            {
+                return null;
+            }
+
+            string streamLabel = GetProgressStreamLabel(progress.StreamKind);
+            int bucket = Math.Max(0, (int)Math.Floor(progress.Percent / 5.0));
+            string key = (progress.StreamKind ?? string.Empty) + "|" + progress.Total;
+            lock (_progressLogSync)
+            {
+                int previousBucket;
+                if (_progressLogBuckets.TryGetValue(key, out previousBucket) && bucket <= previousBucket)
+                {
+                    return null;
+                }
+
+                _progressLogBuckets[key] = bucket;
+            }
+
+            return "[进度] " + streamLabel + " " + progress.Current + "/" + progress.Total +
+                   " (" + progress.Percent.ToString("0.00") + "%)";
+        }
+
+        private static string GetProgressStreamLabel(string streamKind)
+        {
+            if (string.Equals(streamKind, "Aud", StringComparison.OrdinalIgnoreCase))
+            {
+                return "音频";
+            }
+
+            if (string.Equals(streamKind, "Sub", StringComparison.OrdinalIgnoreCase))
+            {
+                return "字幕";
+            }
+
+            return "视频";
+        }
+
+        private void UpdateStatusFromLog(string line)
+        {
+            if (string.IsNullOrWhiteSpace(line) || _activeProcess == null ||
+                _activeOperation != OperationKind.Download || _isCancelling)
+            {
+                return;
+            }
+
+            string message = DownloaderLogPrefix.Replace(line.Trim(), string.Empty);
+            if (message.StartsWith("正在解析媒体信息", StringComparison.OrdinalIgnoreCase))
+            {
+                AdvanceDownloadPhase(DownloadPhase.Parsing, "正在解析媒体信息...");
+            }
+            else if (message.StartsWith("开始下载", StringComparison.OrdinalIgnoreCase))
+            {
+                AdvanceDownloadPhase(DownloadPhase.Downloading, "正在下载视频分片...");
+            }
+            else if (
+                message.StartsWith("二进制合并中", StringComparison.OrdinalIgnoreCase) ||
+                message.StartsWith("正在合并", StringComparison.OrdinalIgnoreCase) ||
+                message.StartsWith("开始合并", StringComparison.OrdinalIgnoreCase) ||
+                message.StartsWith("正在混流", StringComparison.OrdinalIgnoreCase) ||
+                message.StartsWith("Muxing to ", StringComparison.OrdinalIgnoreCase))
+            {
+                AdvanceDownloadPhase(DownloadPhase.Merging, "正在合并媒体文件...");
+            }
+        }
+
+        private void AdvanceDownloadPhase(DownloadPhase phase, string statusText)
+        {
+            if (_activeOperation != OperationKind.Download || _isCancelling || phase < _downloadPhase)
+            {
+                return;
+            }
+
+            _downloadPhase = phase;
+            if (phase == DownloadPhase.Merging)
+            {
+                _progressBar.Style = ProgressBarStyle.Marquee;
+                _progressBar.MarqueeAnimationSpeed = 28;
+            }
+
+            if (!string.IsNullOrWhiteSpace(statusText))
+            {
+                _statusLabel.Text = statusText;
             }
         }
 
         private void CancelButtonClick(object sender, EventArgs e)
         {
+            if (_dependencyInstallInProgress)
+            {
+                DialogResult dependencyResult = MessageBox.Show(
+                    this,
+                    "确定要取消当前工具下载吗？",
+                    "取消工具下载",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Question,
+                    MessageBoxDefaultButton.Button2);
+                if (dependencyResult == DialogResult.Yes)
+                {
+                    _cancelButton.Enabled = false;
+                    _statusLabel.Text = "正在取消工具下载...";
+                    if (_dependencyInstallCancellation != null)
+                    {
+                        _dependencyInstallCancellation.Cancel();
+                    }
+                }
+                return;
+            }
+
             if (_activeProcess == null)
             {
                 return;
@@ -1975,8 +2902,7 @@ namespace M3u8DownloaderGui
                 _statusLabel.Text = "正在取消任务...";
                 AppendLog("[GUI] 正在取消任务...");
 
-                ProcessJob job = _processJob;
-                _processJob = null;
+                ProcessJob job = TakeProcessJob();
                 if (job != null)
                 {
                     job.Dispose();
@@ -2072,10 +2998,23 @@ namespace M3u8DownloaderGui
             }
         }
 
+        private ProcessJob TakeProcessJob()
+        {
+            return System.Threading.Interlocked.Exchange(ref _processJob, null);
+        }
+
+        private void DisposeProcessJob()
+        {
+            ProcessJob job = TakeProcessJob();
+            if (job != null)
+            {
+                job.Dispose();
+            }
+        }
+
         private bool StopProcessForCleanup(Process process, int timeoutMilliseconds)
         {
-            ProcessJob job = _processJob;
-            _processJob = null;
+            ProcessJob job = TakeProcessJob();
             if (job != null)
             {
                 job.Dispose();
@@ -2183,6 +3122,20 @@ namespace M3u8DownloaderGui
             }
         }
 
+        private void SetToolDetectionState(bool isDetecting)
+        {
+            bool enabled = !isDetecting &&
+                !_dependencyInstallInProgress &&
+                _activeProcess == null;
+            _downloaderPathTextBox.Enabled = enabled;
+            _ffmpegPathTextBox.Enabled = enabled;
+            _browseDownloaderButton.Enabled = enabled;
+            _browseFfmpegButton.Enabled = enabled;
+            _detectToolsButton.Enabled = enabled;
+            _startButton.Enabled = enabled;
+            SetSecondaryButtonEnabled(_convertFileButton, enabled);
+        }
+
         private void SetSecondaryButtonEnabled(Button button, bool enabled)
         {
             bool emphasizeKey =
@@ -2255,6 +3208,38 @@ namespace M3u8DownloaderGui
 
         private void MainFormFormClosing(object sender, FormClosingEventArgs e)
         {
+            if (_dependencyInstallInProgress)
+            {
+                if (_closeRequestedDuringDependencyInstall)
+                {
+                    e.Cancel = true;
+                    return;
+                }
+
+                DialogResult dependencyResult = MessageBox.Show(
+                    this,
+                    "工具仍在下载。关闭窗口会取消下载，确定继续吗？",
+                    "工具下载中",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning,
+                    MessageBoxDefaultButton.Button2);
+                if (dependencyResult != DialogResult.Yes)
+                {
+                    e.Cancel = true;
+                    return;
+                }
+
+                _closeRequestedDuringDependencyInstall = true;
+                _cancelButton.Enabled = false;
+                _statusLabel.Text = "正在取消工具下载并清理...";
+                if (_dependencyInstallCancellation != null)
+                {
+                    _dependencyInstallCancellation.Cancel();
+                }
+                e.Cancel = true;
+                return;
+            }
+
             Process processToStop = _activeProcess;
             if (processToStop != null)
             {
@@ -2289,6 +3274,8 @@ namespace M3u8DownloaderGui
                     return;
                 }
 
+                WaitForDownloadOutputCapture(processToStop);
+                ClearDownloadOutputCapture(processToStop);
                 try
                 {
                     processToStop.Dispose();
@@ -2539,6 +3526,14 @@ namespace M3u8DownloaderGui
         {
             Download,
             ConvertFile
+        }
+
+        private enum DownloadPhase
+        {
+            Starting,
+            Parsing,
+            Downloading,
+            Merging
         }
 
         private sealed class FileStamp
