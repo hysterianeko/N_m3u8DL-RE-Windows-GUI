@@ -38,7 +38,13 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: M3U8-Windows-GUI
-          path: build/M3U8视频下载器.exe
+          path: |
+            build/M3U8视频下载器.exe
+            build/Microsoft.Web.WebView2.Core.dll
+            build/Microsoft.Web.WebView2.WinForms.dll
+            build/WebView2Loader.dll
+            LICENSE.WebView2
+            NOTICE.WebView2
           if-no-files-found: error
 
       - name: Package release files
@@ -47,7 +53,7 @@ jobs:
           $version = if ($env:GITHUB_REF_TYPE -eq 'tag') {
             $env:GITHUB_REF_NAME.TrimStart('v')
           } else {
-            '1.2.3-ci'
+            $null
           }
           .\package.ps1 -Version $version -SkipBuild
 

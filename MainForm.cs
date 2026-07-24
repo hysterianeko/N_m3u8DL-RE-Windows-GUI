@@ -3,6 +3,7 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Text;
 using System.Text.RegularExpressions;
@@ -31,6 +32,12 @@ namespace M3u8DownloaderGui
         private static readonly Regex DownloaderLogPrefix = new Regex(
             @"^(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{3})?[ \t]+" +
             @"(?:TRACE|DEBUG|INFO|WARN|ERROR|FATAL)[ \t]*:[ \t]*",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+        private static readonly Regex DownloaderErrorSeverity = new Regex(
+            @"(?:^|\s)(?:ERROR|FATAL)[ \t]*:[ \t]*",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
+        private static readonly Regex DownloaderWarningSeverity = new Regex(
+            @"(?:^|\s)WARN[ \t]*:[ \t]*",
             RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled);
         private const int MaximumLogCharacters = 1000000;
 
@@ -65,6 +72,7 @@ namespace M3u8DownloaderGui
         private Button _convertFileButton;
         private Button _copyLogButton;
         private Button _clearLogButton;
+        private Button _captureButton;
 
         private CheckBox _muxToMp4CheckBox;
         private CheckBox _openFolderWhenDoneCheckBox;
@@ -79,7 +87,9 @@ namespace M3u8DownloaderGui
         private ProcessOutputPump _downloadOutputPump;
         private ExternalToolOutputParser _downloadStandardOutputParser;
         private ExternalToolOutputParser _downloadStandardErrorParser;
+        private CurlMediaProxy _activeMediaProxy;
         private bool _isCancelling;
+        private bool _isPausing;
         private bool _updatingAutoName;
         private bool _fileNameWasEdited;
         private string _lastAutoName = string.Empty;
@@ -88,11 +98,19 @@ namespace M3u8DownloaderGui
         private string _lastOutputPath;
         private string _expectedOutputBaseName;
         private string _importedPlaylistPath;
+        private string _supersededImportedPlaylistPath;
         private string _manualHlsKey = string.Empty;
         private string _manualHlsIv = string.Empty;
+        private MediaRequestHeaders _capturedHeaders;
         private string _temporaryHlsKeyPath;
         private string _temporaryHlsIvPath;
         private string _downloadTemporaryDirectory;
+        private DownloadRequest _resumableRequest;
+        private DownloadResumeManifest _downloadResumeManifest;
+        private DownloadResumeActivityLease _downloadResumeLease;
+        private DownloadTaskState _downloadTaskState;
+        private bool _restoringResumeTask;
+        private bool _resumeTaskTouchedThisSession;
         private readonly List<string> _secretRedactionValues = new List<string>();
         private OperationKind _activeOperation;
         private DownloadPhase _downloadPhase;
@@ -107,6 +125,8 @@ namespace M3u8DownloaderGui
         private CancellationTokenSource _dependencyInstallCancellation;
         private Task<DependencyInstallResult> _dependencyInstallTask;
         private string _lastDependencyInstallStage;
+        private string _lastDownloaderError;
+        private string _lastDownloaderWarning;
 
         public MainForm()
             : this(true)
@@ -209,6 +229,26 @@ namespace M3u8DownloaderGui
                 _keyOptionsButton.FlatAppearance.BorderColor == BorderColor &&
                 _startButton.Text == "开始下载";
 
+            _downloadTaskState = DownloadTaskState.Paused;
+            UpdateDownloadActionButtons();
+            bool pausedActionsAreClear =
+                _startButton.Text == "继续" &&
+                _startButton.Enabled &&
+                _cancelButton.Text == "清除缓存" &&
+                _cancelButton.Enabled;
+            _downloadTaskState = DownloadTaskState.Failed;
+            UpdateDownloadActionButtons();
+            bool failedActionCanRetry =
+                _startButton.Text == "重试下载" && _startButton.Enabled;
+            _downloadTaskState = DownloadTaskState.Completed;
+            UpdateDownloadActionButtons();
+            bool completedActionCanReset =
+                _startButton.Text == "完成" &&
+                _startButton.Enabled &&
+                !_cancelButton.Enabled;
+            _downloadTaskState = DownloadTaskState.Idle;
+            UpdateDownloadActionButtons();
+
             Process smokeProcess = new Process();
             _activeProcess = smokeProcess;
             _activeOperation = OperationKind.Download;
@@ -288,20 +328,137 @@ namespace M3u8DownloaderGui
             bool logLimitIsEnforced = _logTextBox.TextLength <= MaximumLogCharacters;
             _logTextBox.Clear();
             _statusLabel.Text = "就绪";
+            bool restartResumeUiWorks = RunRestartResumeUiSmokeTest();
 
             return controlsExist && namingWorks && layoutIsStable &&
                    runningStateIsClear && idleStateIsRestored &&
                    configuredKeyIsDisabledClearly && configuredKeyStyleIsRestored &&
-                   clearedKeyStyleIsRestored && mergeModeWarningDoesNotChangePhase &&
+                   clearedKeyStyleIsRestored && pausedActionsAreClear &&
+                   failedActionCanRetry && completedActionCanReset &&
+                   mergeModeWarningDoesNotChangePhase &&
                    numericProgressIsVisible && lateProgressDoesNotUndoMerging &&
                    cancellationStatusHasPriority && progressMilestonesAreDeduplicated &&
-                   logLimitIsEnforced;
+                   logLimitIsEnforced && restartResumeUiWorks;
+        }
+
+        private bool RunRestartResumeUiSmokeTest()
+        {
+            string testRoot = Path.Combine(
+                Path.GetTempPath(),
+                "M3u8DownloaderGui_UiResumeSmoke_" + Guid.NewGuid().ToString("N"));
+            IDisposable rootScope = null;
+            string cacheDirectory = null;
+            try
+            {
+                rootScope = DownloadResumeStore.UseIsolatedRootForTests(testRoot);
+                cacheDirectory = DownloadResumeStore.CreateOwnedCacheForTests();
+                string playlist =
+                    "#EXTM3U\n#EXTINF:4,\nhttps://cdn.example.test/video0.ts?token=secret\n";
+                MediaRequestHeaders headers = new MediaRequestHeaders();
+                headers.Cookie = "session=resume-smoke-secret";
+                headers.Referer = "https://example.test/watch";
+                headers.UserAgent = "ResumeSmoke/1.0";
+                headers.SourceUrl = "https://cdn.example.test/video0.ts?token=secret";
+
+                DownloadResumeManifest manifest = new DownloadResumeManifest();
+                manifest.CacheDirectory = cacheDirectory;
+                manifest.State = DownloadResumeState.Running;
+                manifest.SaveDirectory = Path.Combine(testRoot, "output");
+                manifest.FileName = "restart-resume-smoke";
+                manifest.DownloaderPath = Path.Combine(testRoot, "N_m3u8DL-RE.exe");
+                manifest.FfmpegPath = Path.Combine(testRoot, "ffmpeg.exe");
+                manifest.MuxToMp4 = true;
+                manifest.Input = Path.Combine(testRoot, "deleted-import.m3u8");
+                manifest.InputIsImportedPlaylist = true;
+                manifest.ImportedPlaylistContent = playlist;
+                manifest.CapturedHeaders = headers;
+                string saveError;
+                if (!DownloadResumeStore.TrySave(manifest, out saveError))
+                {
+                    return false;
+                }
+
+                RestoreInterruptedDownload();
+                bool restored =
+                    _downloadTaskState == DownloadTaskState.Paused &&
+                    _resumableRequest != null &&
+                    string.Equals(
+                        _downloadTemporaryDirectory,
+                        cacheDirectory,
+                        StringComparison.OrdinalIgnoreCase) &&
+                    !File.Exists(_resumableRequest.Input) &&
+                    string.Equals(_resumableRequest.FileName, manifest.FileName, StringComparison.Ordinal) &&
+                    _capturedHeaders != null &&
+                    string.Equals(
+                        _capturedHeaders.Cookie,
+                        headers.Cookie,
+                        StringComparison.Ordinal) &&
+                    _downloadResumeLease != null &&
+                    _startButton.Text == "继续" &&
+                    _cancelButton.Text == "清除缓存";
+
+                string restoredInput = _resumableRequest.Input;
+                _urlTextBox.Text = "https://draft.example.test/other.m3u8";
+                bool editingDoesNotDiscard =
+                    Directory.Exists(cacheDirectory) &&
+                    File.Exists(Path.Combine(
+                        cacheDirectory,
+                        DownloadResumeStore.ManifestFileName));
+                SetInputWithoutTaskTransition(restoredInput);
+                string materializeError;
+                bool materializedOnDemand = EnsureRestoredInputMaterialized(
+                    out materializeError) &&
+                    File.Exists(_resumableRequest.Input);
+                string materializedInput = _importedPlaylistPath;
+                DeleteImportedPlaylist(false);
+                bool closeCleanupPreservesResume =
+                    !File.Exists(materializedInput) &&
+                    Directory.Exists(cacheDirectory) &&
+                    File.Exists(Path.Combine(
+                        cacheDirectory,
+                        DownloadResumeStore.ManifestFileName)) &&
+                    _downloadTaskState == DownloadTaskState.Paused &&
+                    _resumableRequest != null;
+                bool discarded = DiscardResumableDownload() &&
+                    !Directory.Exists(cacheDirectory) &&
+                    _capturedHeaders == null;
+                cacheDirectory = null;
+                return restored && editingDoesNotDiscard && materializedOnDemand &&
+                    closeCleanupPreservesResume && discarded;
+            }
+            catch
+            {
+                return false;
+            }
+            finally
+            {
+                ReleaseDownloadResumeLease();
+                if (!string.IsNullOrWhiteSpace(cacheDirectory) && Directory.Exists(cacheDirectory))
+                {
+                    string discardError;
+                    DownloadResumeStore.TryDiscard(cacheDirectory, out discardError);
+                }
+                if (rootScope != null)
+                {
+                    rootScope.Dispose();
+                }
+                try
+                {
+                    if (Directory.Exists(testRoot))
+                    {
+                        Directory.Delete(testRoot, true);
+                    }
+                }
+                catch
+                {
+                }
+            }
         }
 
         private void InitializeForm()
         {
             SuspendLayout();
-            Text = "M3U8 视频下载器";
+            Text = "M3U8 视频下载器 1.4.0";
             StartPosition = FormStartPosition.CenterScreen;
             ClientSize = new Size(900, 760);
             MinimumSize = new Size(800, 680);
@@ -502,11 +659,15 @@ namespace M3u8DownloaderGui
             _convertFileButton = CreateSecondaryButton("转换文件...");
             _convertFileButton.Width = 104;
 
+            _captureButton = CreateSecondaryButton("从网页捕获");
+            _captureButton.Width = 104;
+
             primaryActions.Controls.Add(_startButton);
             primaryActions.Controls.Add(_cancelButton);
             primaryActions.Controls.Add(_openFolderButton);
             primaryActions.Controls.Add(_keyOptionsButton);
             primaryActions.Controls.Add(_convertFileButton);
+            primaryActions.Controls.Add(_captureButton);
 
             FlowLayoutPanel logActions = new FlowLayoutPanel();
             logActions.Dock = DockStyle.Fill;
@@ -743,6 +904,7 @@ namespace M3u8DownloaderGui
             _convertFileButton.Click += ConvertFileButtonClick;
             _copyLogButton.Click += CopyLogButtonClick;
             _clearLogButton.Click += delegate { ClearLog(); };
+            _captureButton.Click += CaptureButtonClick;
             Shown += MainFormShown;
             FormClosing += MainFormFormClosing;
         }
@@ -770,6 +932,8 @@ namespace M3u8DownloaderGui
             {
                 _statusLabel.Text = "Blob 是浏览器临时地址，请从猫抓复制“原始m3u8”内容";
             }
+
+            HandleUrlChangeForTaskState();
 
             if (!_fileNameWasEdited || string.IsNullOrWhiteSpace(_fileNameTextBox.Text) ||
                 string.Equals(_fileNameTextBox.Text, _lastAutoName, StringComparison.Ordinal))
@@ -859,6 +1023,11 @@ namespace M3u8DownloaderGui
 
         private void ImportPlaylistContent(string content)
         {
+            ImportPlaylistContent(content, "剪贴板");
+        }
+
+        private void ImportPlaylistContent(string content, string sourceDescription)
+        {
             try
             {
                 if (PlaylistInput.ContainsRelativeMediaReferences(content))
@@ -889,8 +1058,11 @@ namespace M3u8DownloaderGui
                 ApplyAutomaticName(false);
                 _urlTextBox.SelectionStart = _urlTextBox.TextLength;
                 _urlTextBox.Focus();
-                _statusLabel.Text = "已从剪贴板导入播放列表";
-                AppendLog("[GUI] 已导入剪贴板中的播放列表：" + path);
+                string source = string.IsNullOrWhiteSpace(sourceDescription)
+                    ? "外部内容"
+                    : sourceDescription;
+                _statusLabel.Text = "已从" + source + "导入播放列表";
+                AppendLog("[GUI] 已导入" + source + "中的播放列表：" + path);
             }
             catch (Exception exception)
             {
@@ -905,10 +1077,16 @@ namespace M3u8DownloaderGui
 
         private void DeleteImportedPlaylist()
         {
+            DeleteImportedPlaylist(true);
+        }
+
+        private void DeleteImportedPlaylist(bool clearInput)
+        {
             string path = _importedPlaylistPath;
             _importedPlaylistPath = null;
             if (string.IsNullOrWhiteSpace(path))
             {
+                DeleteSupersededImportedPlaylist();
                 return;
             }
 
@@ -919,10 +1097,27 @@ namespace M3u8DownloaderGui
                     File.Delete(path);
                 }
 
-                if (_urlTextBox != null &&
+                if (clearInput && _urlTextBox != null &&
                     string.Equals(_urlTextBox.Text.Trim(), path, StringComparison.OrdinalIgnoreCase))
                 {
                     _urlTextBox.Clear();
+                }
+            }
+            catch
+            {
+            }
+            DeleteSupersededImportedPlaylist();
+        }
+
+        private void DeleteSupersededImportedPlaylist()
+        {
+            string path = _supersededImportedPlaylistPath;
+            _supersededImportedPlaylistPath = null;
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(path) && File.Exists(path))
+                {
+                    File.Delete(path);
                 }
             }
             catch
@@ -1053,10 +1248,214 @@ namespace M3u8DownloaderGui
             await PromptForMissingToolsAsync(true, true);
         }
 
+        private void RestoreInterruptedDownload()
+        {
+            DownloadResumeCleanupResult cleanup = DownloadResumeStore.CleanupExpired();
+            if (cleanup.ExpiredDeleted > 0 || cleanup.OrphanedDeleted > 0 ||
+                cleanup.DiscardPendingDeleted > 0)
+            {
+                AppendLog(
+                    "[GUI] 已自动清理过期或待删除缓存：" +
+                    (cleanup.ExpiredDeleted + cleanup.OrphanedDeleted +
+                     cleanup.DiscardPendingDeleted).ToString(CultureInfo.InvariantCulture) +
+                    " 个。");
+            }
+            if (cleanup.DeleteFailed > 0)
+            {
+                AppendLog(
+                    "[GUI] 有 " + cleanup.DeleteFailed.ToString(CultureInfo.InvariantCulture) +
+                    " 个旧缓存仍被占用，将在下次启动时重试清理。");
+            }
+
+            List<DownloadResumeManifest> candidates =
+                DownloadResumeStore.DiscoverRecoverableTasks();
+            foreach (DownloadResumeManifest manifest in candidates)
+            {
+                DownloadResumeActivityLease lease;
+                string leaseError;
+                if (!DownloadResumeStore.TryAcquireActivityLease(
+                    manifest.CacheDirectory,
+                    out lease,
+                    out leaseError))
+                {
+                    continue;
+                }
+                DeleteBrowserTransportPlaylist(manifest.CacheDirectory);
+
+                string effectiveInput = manifest.Input;
+                string inputError = null;
+                if (!manifest.InputIsImportedPlaylist &&
+                    !DownloadResumeStore.TryMaterializeInput(
+                        manifest,
+                        out effectiveInput,
+                        out inputError))
+                {
+                    lease.Dispose();
+                    AppendLog(
+                        "[GUI] 无法恢复缓存中的任务输入：" + inputError +
+                        " 缓存仍会按保留期限自动清理。");
+                    continue;
+                }
+                if (manifest.InputIsImportedPlaylist && File.Exists(effectiveInput))
+                {
+                    try
+                    {
+                        File.Delete(effectiveInput);
+                    }
+                    catch
+                    {
+                    }
+                }
+
+                DownloadRequest request = CreateDownloadRequest(manifest, effectiveInput);
+                _restoringResumeTask = true;
+                _updatingAutoName = true;
+                try
+                {
+                    _urlTextBox.Text = effectiveInput;
+                    _saveDirectoryTextBox.Text = manifest.SaveDirectory;
+                    _fileNameTextBox.Text = manifest.FileName;
+                    _downloaderPathTextBox.Text = manifest.DownloaderPath;
+                    _ffmpegPathTextBox.Text = manifest.FfmpegPath;
+                    _muxToMp4CheckBox.Checked = manifest.MuxToMp4;
+                    _manualHlsKey = manifest.HlsKey ?? string.Empty;
+                    _manualHlsIv = manifest.HlsIv ?? string.Empty;
+                    _capturedHeaders = manifest.CapturedHeaders == null
+                        ? null
+                        : manifest.CapturedHeaders.Clone();
+                    _importedPlaylistPath = manifest.InputIsImportedPlaylist
+                        ? effectiveInput
+                        : null;
+                    _downloadTemporaryDirectory = manifest.CacheDirectory;
+                    _downloadResumeManifest = manifest;
+                    _downloadResumeLease = lease;
+                    _resumableRequest = request;
+                    _resumeTaskTouchedThisSession = false;
+                    _downloadTaskState = manifest.State == DownloadResumeState.Failed
+                        ? DownloadTaskState.Failed
+                        : DownloadTaskState.Paused;
+                    _fileNameWasEdited = true;
+                    _lastAutoName = manifest.FileName;
+                }
+                finally
+                {
+                    _updatingAutoName = false;
+                    _restoringResumeTask = false;
+                }
+
+                UpdateKeyState();
+                SetToolStatusPending();
+                UpdateDownloadActionButtons();
+                ShowRestoredDownloadStatus();
+                AppendLog(
+                    "[GUI] 已恢复上次未完成任务；继续时将复用分片缓存：" +
+                    _downloadTemporaryDirectory);
+                if (candidates.Count > 1)
+                {
+                    AppendLog(
+                        "[GUI] 另有 " + (candidates.Count - 1).ToString(CultureInfo.InvariantCulture) +
+                        " 个未完成任务正由其他实例使用或等待到期清理。");
+                }
+                return;
+            }
+        }
+
+        private static DownloadRequest CreateDownloadRequest(
+            DownloadResumeManifest manifest,
+            string effectiveInput)
+        {
+            DownloadRequest request = new DownloadRequest();
+            request.Input = effectiveInput;
+            request.SaveDirectory = manifest.SaveDirectory;
+            request.FileName = manifest.FileName;
+            request.DownloaderPath = manifest.DownloaderPath;
+            request.FfmpegPath = manifest.FfmpegPath;
+            request.MuxToMp4 = manifest.MuxToMp4;
+            request.HlsKey = manifest.HlsKey ?? string.Empty;
+            request.HlsIv = manifest.HlsIv ?? string.Empty;
+            request.InputIsImportedPlaylist = manifest.InputIsImportedPlaylist;
+            request.ImportedPlaylistContent = manifest.ImportedPlaylistContent;
+            request.CapturedHeaders = manifest.CapturedHeaders == null
+                ? null
+                : manifest.CapturedHeaders.Clone();
+            return request;
+        }
+
+        private void ShowRestoredDownloadStatus()
+        {
+            if (_resumableRequest == null || string.IsNullOrWhiteSpace(_downloadTemporaryDirectory))
+            {
+                return;
+            }
+
+            long cacheBytes = GetDirectorySize(_downloadTemporaryDirectory);
+            _statusLabel.Text = cacheBytes > 0
+                ? "已恢复未完成任务，缓存 " + FormatByteCount(cacheBytes)
+                : "已恢复未完成任务，可继续或清除缓存";
+            UpdateDownloadActionButtons();
+        }
+
+        private static long GetDirectorySize(string rootDirectory)
+        {
+            if (string.IsNullOrWhiteSpace(rootDirectory) || !Directory.Exists(rootDirectory))
+            {
+                return 0;
+            }
+
+            long total = 0;
+            Stack<string> pending = new Stack<string>();
+            pending.Push(rootDirectory);
+            while (pending.Count > 0)
+            {
+                string directory = pending.Pop();
+                try
+                {
+                    foreach (string file in Directory.GetFiles(directory, "*", SearchOption.TopDirectoryOnly))
+                    {
+                        try
+                        {
+                            total = checked(total + new FileInfo(file).Length);
+                        }
+                        catch
+                        {
+                        }
+                    }
+
+                    foreach (string child in Directory.GetDirectories(
+                        directory,
+                        "*",
+                        SearchOption.TopDirectoryOnly))
+                    {
+                        try
+                        {
+                            if ((File.GetAttributes(child) & FileAttributes.ReparsePoint) == 0)
+                            {
+                                pending.Push(child);
+                            }
+                        }
+                        catch
+                        {
+                        }
+                    }
+                }
+                catch
+                {
+                }
+            }
+
+            return total;
+        }
+
         private async void MainFormShown(object sender, EventArgs e)
         {
             Shown -= MainFormShown;
-            if (!_enableStartupDependencyPrompt || _startupDependencyPromptShown)
+            if (!_enableStartupDependencyPrompt)
+            {
+                return;
+            }
+
+            RestoreInterruptedDownload();
+            if (_startupDependencyPromptShown)
             {
                 return;
             }
@@ -1074,6 +1473,13 @@ namespace M3u8DownloaderGui
                 _activeProcess == null)
             {
                 SetToolDetectionState(false);
+            }
+
+            if (!IsDisposed && !Disposing && _resumableRequest != null)
+            {
+                _resumableRequest.DownloaderPath = _downloaderPathTextBox.Text.Trim();
+                _resumableRequest.FfmpegPath = _ffmpegPathTextBox.Text.Trim();
+                ShowRestoredDownloadStatus();
             }
         }
 
@@ -1558,6 +1964,28 @@ namespace M3u8DownloaderGui
 
         private async void StartButtonClick(object sender, EventArgs e)
         {
+            if (_activeProcess != null)
+            {
+                if (_activeOperation == OperationKind.Download && !_isCancelling)
+                {
+                    StopActiveProcess(true);
+                }
+                return;
+            }
+
+            if (_downloadTaskState == DownloadTaskState.Completed)
+            {
+                ResetCompletedDownloadState();
+                return;
+            }
+
+            string restoreInputError;
+            if (!EnsureRestoredInputMaterialized(out restoreInputError))
+            {
+                ShowError("无法恢复加密保存的播放列表：\r\n\r\n" + restoreInputError);
+                return;
+            }
+
             if (!await PromptForMissingToolsAsync(true, true))
             {
                 return;
@@ -1569,7 +1997,10 @@ namespace M3u8DownloaderGui
                 return;
             }
 
-            string[] conflicts = FindExistingOutputs(request.SaveDirectory, request.FileName);
+            bool resumeExistingTask = CanResumeDownload(request);
+            string[] conflicts = resumeExistingTask
+                ? new string[0]
+                : FindExistingOutputs(request.SaveDirectory, request.FileName);
             if (conflicts.Length > 0)
             {
                 DialogResult overwriteResult = MessageBox.Show(
@@ -1585,8 +2016,52 @@ namespace M3u8DownloaderGui
                 }
             }
 
+            if ((_downloadTaskState == DownloadTaskState.Paused ||
+                 _downloadTaskState == DownloadTaskState.Failed) &&
+                !resumeExistingTask)
+            {
+                DialogResult replaceTask = MessageBox.Show(
+                    this,
+                    "当前输入或下载参数与已保留任务不同。开始新任务会永久删除旧任务的分片缓存。\r\n\r\n是否放弃旧任务并继续？",
+                    "开始新任务",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning,
+                    MessageBoxDefaultButton.Button2);
+                if (replaceTask != DialogResult.Yes)
+                {
+                    return;
+                }
+
+                if (!string.Equals(
+                        request.Input,
+                        _resumableRequest.Input,
+                        StringComparison.Ordinal) &&
+                    CapturedHeadersEqual(
+                        request.CapturedHeaders,
+                        _resumableRequest.CapturedHeaders))
+                {
+                    request.CapturedHeaders = null;
+                }
+                string preserveInputError;
+                if (!TryPreserveImportedInputBeforeDiscard(
+                    request,
+                    out preserveInputError))
+                {
+                    ShowError(
+                        "无法在清理旧缓存前保留播放列表，因此没有开始新任务：\r\n\r\n" +
+                        preserveInputError);
+                    return;
+                }
+                if (!DiscardResumableDownload())
+                {
+                    ShowError("旧任务缓存仍被占用，无法开始新任务。请关闭可能占用缓存文件的程序后重试。");
+                    return;
+                }
+                AppendLog("[GUI] 下载参数已变化，已清理旧任务缓存并开始新任务。");
+            }
+
             SaveCurrentSettings();
-            StartDownload(request);
+            StartDownload(request, resumeExistingTask);
         }
 
         private void KeyOptionsButtonClick(object sender, EventArgs e)
@@ -1609,10 +2084,410 @@ namespace M3u8DownloaderGui
             bool hasKey = !string.IsNullOrWhiteSpace(_manualHlsKey);
             _keyOptionsButton.Text = hasKey ? "密钥已设置" : "密钥...";
             SetSecondaryButtonEnabled(_keyOptionsButton, _keyOptionsButton.Enabled);
-            _startButton.Text = hasKey ? "使用密钥下载" : "开始下载";
+            UpdateDownloadActionButtons();
             _toolTip.SetToolTip(
                 _keyOptionsButton,
                 hasKey ? "已设置手动 HLS 密钥；不会保存到配置文件" : "设置可选的 HLS AES-128 密钥和 IV");
+        }
+
+        private void HandleUrlChangeForTaskState()
+        {
+            if (_restoringResumeTask || _activeProcess != null || _resumableRequest == null)
+            {
+                return;
+            }
+
+            string currentInput = _urlTextBox.Text.Trim();
+            if (string.Equals(currentInput, _resumableRequest.Input, StringComparison.Ordinal))
+            {
+                return;
+            }
+
+            if (_downloadTaskState == DownloadTaskState.Completed)
+            {
+                ResetCompletedDownloadState();
+            }
+            else if (_downloadTaskState == DownloadTaskState.Paused ||
+                     _downloadTaskState == DownloadTaskState.Failed)
+            {
+                _statusLabel.Text = "输入已变化；开始新任务时会先确认是否清除旧缓存";
+                return;
+            }
+
+            if (!string.IsNullOrWhiteSpace(_importedPlaylistPath) &&
+                !string.Equals(currentInput, _importedPlaylistPath, StringComparison.OrdinalIgnoreCase))
+            {
+                DeleteImportedPlaylist();
+            }
+        }
+
+        private bool CanResumeDownload(DownloadRequest request)
+        {
+            return (_downloadTaskState == DownloadTaskState.Paused ||
+                    _downloadTaskState == DownloadTaskState.Failed) &&
+                   _resumableRequest != null &&
+                   !string.IsNullOrWhiteSpace(_downloadTemporaryDirectory) &&
+                   Directory.Exists(_downloadTemporaryDirectory) &&
+                   DownloadRequestsMatch(_resumableRequest, request);
+        }
+
+        private static bool DownloadRequestsMatch(DownloadRequest left, DownloadRequest right)
+        {
+            return left != null && right != null &&
+                   string.Equals(left.Input, right.Input, StringComparison.Ordinal) &&
+                   string.Equals(left.SaveDirectory, right.SaveDirectory, StringComparison.OrdinalIgnoreCase) &&
+                   string.Equals(left.FileName, right.FileName, StringComparison.OrdinalIgnoreCase) &&
+                   left.MuxToMp4 == right.MuxToMp4 &&
+                   string.Equals(left.HlsKey, right.HlsKey, StringComparison.Ordinal) &&
+                   string.Equals(left.HlsIv, right.HlsIv, StringComparison.Ordinal);
+        }
+
+        private static bool CapturedHeadersEqual(
+            MediaRequestHeaders left,
+            MediaRequestHeaders right)
+        {
+            if (ReferenceEquals(left, right))
+            {
+                return true;
+            }
+            if (left == null || right == null ||
+                !string.Equals(left.Referer, right.Referer, StringComparison.Ordinal) ||
+                !string.Equals(left.Cookie, right.Cookie, StringComparison.Ordinal) ||
+                !string.Equals(left.UserAgent, right.UserAgent, StringComparison.Ordinal) ||
+                !string.Equals(left.Origin, right.Origin, StringComparison.Ordinal) ||
+                !string.Equals(left.Authorization, right.Authorization, StringComparison.Ordinal) ||
+                !string.Equals(left.SourceUrl, right.SourceUrl, StringComparison.Ordinal) ||
+                left.AdditionalHeaders.Count != right.AdditionalHeaders.Count)
+            {
+                return false;
+            }
+
+            foreach (KeyValuePair<string, string> header in left.AdditionalHeaders)
+            {
+                string rightValue;
+                if (!right.AdditionalHeaders.TryGetValue(header.Key, out rightValue) ||
+                    !string.Equals(header.Value, rightValue, StringComparison.Ordinal))
+                {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        private void ClearCapturedHeadersForRequest(DownloadRequest request)
+        {
+            if (request != null && CapturedHeadersEqual(_capturedHeaders, request.CapturedHeaders))
+            {
+                _capturedHeaders = null;
+            }
+        }
+
+        private bool TryPersistDownloadResume(
+            DownloadRequest request,
+            DownloadResumeState state,
+            out string errorMessage)
+        {
+            errorMessage = null;
+            if (request == null || string.IsNullOrWhiteSpace(_downloadTemporaryDirectory) ||
+                !Directory.Exists(_downloadTemporaryDirectory))
+            {
+                errorMessage = "下载缓存目录已经不存在。";
+                return false;
+            }
+
+            bool inputIsImported = request.InputIsImportedPlaylist;
+            string importedContent = request.ImportedPlaylistContent;
+            if (inputIsImported)
+            {
+                try
+                {
+                    if (File.Exists(request.Input))
+                    {
+                        importedContent = File.ReadAllText(request.Input, Encoding.UTF8);
+                    }
+                }
+                catch (Exception exception)
+                {
+                    errorMessage = "无法保存导入的播放列表：" + exception.Message;
+                    return false;
+                }
+
+                if (string.IsNullOrWhiteSpace(importedContent) &&
+                    _downloadResumeManifest != null &&
+                    _downloadResumeManifest.InputIsImportedPlaylist)
+                {
+                    importedContent = _downloadResumeManifest.ImportedPlaylistContent;
+                }
+                if (string.IsNullOrWhiteSpace(importedContent))
+                {
+                    errorMessage = "导入的播放列表正文已经不存在。";
+                    return false;
+                }
+                request.ImportedPlaylistContent = importedContent;
+            }
+
+            DownloadResumeManifest manifest = _downloadResumeManifest ??
+                new DownloadResumeManifest();
+            manifest.CacheDirectory = _downloadTemporaryDirectory;
+            manifest.State = state;
+            manifest.SaveDirectory = request.SaveDirectory;
+            manifest.FileName = request.FileName;
+            manifest.DownloaderPath = request.DownloaderPath;
+            manifest.FfmpegPath = request.FfmpegPath;
+            manifest.MuxToMp4 = request.MuxToMp4;
+            manifest.Input = request.Input;
+            manifest.InputIsImportedPlaylist = inputIsImported;
+            manifest.ImportedPlaylistContent = importedContent;
+            manifest.HlsKey = request.HlsKey;
+            manifest.HlsIv = request.HlsIv;
+            manifest.CapturedHeaders = request.CapturedHeaders == null
+                ? null
+                : request.CapturedHeaders.Clone();
+
+            if (!DownloadResumeStore.TrySave(manifest, out errorMessage))
+            {
+                return false;
+            }
+
+            _downloadResumeManifest = manifest;
+            return true;
+        }
+
+        private bool EnsureRestoredInputMaterialized(out string errorMessage)
+        {
+            errorMessage = null;
+            if (_downloadResumeManifest == null ||
+                !_downloadResumeManifest.InputIsImportedPlaylist ||
+                _resumableRequest == null ||
+                !string.Equals(
+                    _urlTextBox.Text.Trim(),
+                    _resumableRequest.Input,
+                    StringComparison.Ordinal) ||
+                File.Exists(_resumableRequest.Input))
+            {
+                return true;
+            }
+
+            string input;
+            if (!DownloadResumeStore.TryMaterializeInput(
+                _downloadResumeManifest,
+                out input,
+                out errorMessage))
+            {
+                return false;
+            }
+
+            _resumableRequest.Input = input;
+            _importedPlaylistPath = input;
+            SetInputWithoutTaskTransition(input);
+            return true;
+        }
+
+        private bool TryPreserveImportedInputBeforeDiscard(
+            DownloadRequest request,
+            out string errorMessage)
+        {
+            errorMessage = null;
+            if (request == null || _resumableRequest == null ||
+                !_resumableRequest.InputIsImportedPlaylist ||
+                !string.Equals(
+                    request.Input,
+                    _resumableRequest.Input,
+                    StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            string content = _resumableRequest.ImportedPlaylistContent;
+            if (string.IsNullOrWhiteSpace(content) && _downloadResumeManifest != null)
+            {
+                content = _downloadResumeManifest.ImportedPlaylistContent;
+            }
+            if (string.IsNullOrWhiteSpace(content))
+            {
+                try
+                {
+                    content = File.ReadAllText(request.Input, Encoding.UTF8);
+                }
+                catch (Exception exception)
+                {
+                    errorMessage = exception.Message;
+                    return false;
+                }
+            }
+
+            try
+            {
+                string importDirectory = GetImportedPlaylistDirectory();
+                Directory.CreateDirectory(importDirectory);
+                string path = Path.Combine(
+                    importDirectory,
+                    "pasted_recovered_" + DateTime.Now.ToString("yyyyMMdd_HHmmss_fff") +
+                    PlaylistInput.GetExtension(content));
+                File.WriteAllText(path, content, new UTF8Encoding(false));
+                request.Input = path;
+                request.InputIsImportedPlaylist = true;
+                request.ImportedPlaylistContent = content;
+                _importedPlaylistPath = path;
+                SetInputWithoutTaskTransition(path);
+                return true;
+            }
+            catch (Exception exception)
+            {
+                errorMessage = exception.Message;
+                return false;
+            }
+        }
+
+        private bool TryCanonicalizeImportedInput(
+            DownloadRequest request,
+            out string errorMessage)
+        {
+            errorMessage = null;
+            if (request == null || !request.InputIsImportedPlaylist)
+            {
+                return true;
+            }
+
+            string content = request.ImportedPlaylistContent;
+            if (File.Exists(request.Input))
+            {
+                try
+                {
+                    content = File.ReadAllText(request.Input, Encoding.UTF8);
+                }
+                catch (Exception exception)
+                {
+                    errorMessage = exception.Message;
+                    return false;
+                }
+            }
+            if (string.IsNullOrWhiteSpace(content))
+            {
+                errorMessage = "导入的播放列表正文已经不存在。";
+                return false;
+            }
+            request.ImportedPlaylistContent = content;
+
+            DownloadResumeManifest snapshot = new DownloadResumeManifest();
+            snapshot.CacheDirectory = _downloadTemporaryDirectory;
+            snapshot.InputIsImportedPlaylist = true;
+            snapshot.ImportedPlaylistContent = content;
+            string taskInput;
+            if (!DownloadResumeStore.TryMaterializeInput(
+                snapshot,
+                out taskInput,
+                out errorMessage))
+            {
+                return false;
+            }
+
+            string oldInput = request.Input;
+            request.Input = taskInput;
+            _importedPlaylistPath = taskInput;
+            if (_resumableRequest != null &&
+                string.Equals(
+                    _resumableRequest.Input,
+                    oldInput,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                _resumableRequest.Input = taskInput;
+            }
+            SetInputWithoutTaskTransition(taskInput);
+            if (!string.Equals(oldInput, taskInput, StringComparison.OrdinalIgnoreCase))
+            {
+                _supersededImportedPlaylistPath = oldInput;
+            }
+            return true;
+        }
+
+        private void SetInputWithoutTaskTransition(string input)
+        {
+            bool oldRestoring = _restoringResumeTask;
+            bool oldFileNameWasEdited = _fileNameWasEdited;
+            _restoringResumeTask = true;
+            _fileNameWasEdited = true;
+            try
+            {
+                _urlTextBox.Text = input ?? string.Empty;
+            }
+            finally
+            {
+                _fileNameWasEdited = oldFileNameWasEdited;
+                _restoringResumeTask = oldRestoring;
+            }
+        }
+
+        private bool EnsureDownloadResumeLease(out string errorMessage)
+        {
+            errorMessage = null;
+            if (_downloadResumeLease != null)
+            {
+                return true;
+            }
+
+            return DownloadResumeStore.TryAcquireActivityLease(
+                _downloadTemporaryDirectory,
+                out _downloadResumeLease,
+                out errorMessage);
+        }
+
+        private bool PersistDownloadResumeOrLog(DownloadResumeState state)
+        {
+            string errorMessage;
+            if (TryPersistDownloadResume(_resumableRequest, state, out errorMessage))
+            {
+                return true;
+            }
+
+            AppendLog("[GUI] 无法更新重启恢复信息：" + errorMessage);
+            return false;
+        }
+
+        private void ReleaseDownloadResumeLease()
+        {
+            DownloadResumeActivityLease lease = _downloadResumeLease;
+            _downloadResumeLease = null;
+            if (lease != null)
+            {
+                lease.Dispose();
+            }
+        }
+
+        private bool DiscardResumableDownload()
+        {
+            ClearCapturedHeadersForRequest(_resumableRequest);
+            _resumeTaskTouchedThisSession = false;
+            if (!DeleteDownloadTemporaryDirectory())
+            {
+                _resumableRequest = null;
+                _downloadResumeManifest = null;
+                _downloadTaskState = DownloadTaskState.Idle;
+                UpdateDownloadActionButtons();
+                return false;
+            }
+
+            DeleteTemporarySecrets();
+            _resumableRequest = null;
+            _downloadResumeManifest = null;
+            _downloadTaskState = DownloadTaskState.Idle;
+            _lastOutputPath = null;
+            ResetDownloadProgress();
+            UpdateDownloadActionButtons();
+            return true;
+        }
+
+        private void ResetCompletedDownloadState()
+        {
+            ClearCapturedHeadersForRequest(_resumableRequest);
+            _resumeTaskTouchedThisSession = false;
+            _resumableRequest = null;
+            _downloadResumeManifest = null;
+            _downloadTaskState = DownloadTaskState.Idle;
+            _lastOutputPath = null;
+            ResetDownloadProgress();
+            _statusLabel.Text = "准备下载";
+            UpdateDownloadActionButtons();
         }
 
         private async void ConvertFileButtonClick(object sender, EventArgs e)
@@ -1789,17 +2664,18 @@ namespace M3u8DownloaderGui
                 processStarted = true;
 
                 ProcessJob job = ProcessJob.TryCreateKillOnClose();
-                if (job != null)
+                if (job == null)
                 {
-                    if (job.AddProcess(process))
-                    {
-                        _processJob = job;
-                    }
-                    else
-                    {
-                        job.Dispose();
-                    }
+                    throw new InvalidOperationException(
+                        "无法创建转换进程保护 Job，已停止 FFmpeg。");
                 }
+                if (!job.AddProcess(process))
+                {
+                    job.Dispose();
+                    throw new InvalidOperationException(
+                        "无法把 FFmpeg 加入转换进程保护 Job，已停止转换。");
+                }
+                _processJob = job;
 
                 process.BeginOutputReadLine();
                 process.BeginErrorReadLine();
@@ -1986,6 +2862,44 @@ namespace M3u8DownloaderGui
             request.MuxToMp4 = _muxToMp4CheckBox.Checked;
             request.HlsKey = _manualHlsKey;
             request.HlsIv = _manualHlsIv;
+            request.InputIsImportedPlaylist =
+                !string.IsNullOrWhiteSpace(_importedPlaylistPath) &&
+                string.Equals(input, _importedPlaylistPath, StringComparison.OrdinalIgnoreCase);
+            if (request.InputIsImportedPlaylist)
+            {
+                try
+                {
+                    request.ImportedPlaylistContent = File.ReadAllText(input, Encoding.UTF8);
+                }
+                catch (Exception exception)
+                {
+                    ShowValidationError(
+                        "无法读取导入的播放列表：" + exception.Message,
+                        _urlTextBox);
+                    return false;
+                }
+            }
+            request.CapturedHeaders = _capturedHeaders == null
+                ? null
+                : _capturedHeaders.Clone();
+            Uri remoteInput;
+            if (request.CapturedHeaders != null &&
+                Uri.TryCreate(input, UriKind.Absolute, out remoteInput) &&
+                (remoteInput.Scheme == Uri.UriSchemeHttp ||
+                 remoteInput.Scheme == Uri.UriSchemeHttps) &&
+                (RequiresCapturedHeaderIsolation(request.CapturedHeaders) ||
+                 (!string.IsNullOrWhiteSpace(request.CapturedHeaders.SourceUrl) &&
+                  !MediaRequestHeaders.AreSameOrigin(
+                      input,
+                      request.CapturedHeaders.SourceUrl))))
+            {
+                MediaRequestHeaders userAgentOnly = new MediaRequestHeaders();
+                userAgentOnly.UserAgent = request.CapturedHeaders.UserAgent;
+                request.CapturedHeaders = userAgentOnly.HasAny ? userAgentOnly : null;
+                AppendLog(
+                    "[GUI] 远程播放列表不会全局转发 Cookie、Authorization 或自定义凭据，" +
+                    "以免泄露给异源分片；需要登录态时请使用“从网页捕获”导入完整播放列表正文。");
+            }
             return true;
         }
 
@@ -2001,8 +2915,13 @@ namespace M3u8DownloaderGui
             return resolvedPath;
         }
 
-        private void StartDownload(DownloadRequest request)
+        private void StartDownload(DownloadRequest request, bool resumeExistingTask)
         {
+            _resumeTaskTouchedThisSession = true;
+            _lastDownloaderError = null;
+            _lastDownloaderWarning = null;
+            StopActiveMediaProxy();
+
             string keyArgument;
             string ivArgument;
             if (!PrepareTemporarySecrets(request.HlsKey, request.HlsIv, out keyArgument, out ivArgument))
@@ -2010,7 +2929,7 @@ namespace M3u8DownloaderGui
                 return;
             }
 
-            if (!DeleteDownloadTemporaryDirectory())
+            if (!resumeExistingTask && !DeleteDownloadTemporaryDirectory())
             {
                 DeleteTemporarySecrets();
                 ShowError("上一次下载的临时目录仍被占用，请稍后重试或关闭占用该目录的程序。");
@@ -2019,7 +2938,19 @@ namespace M3u8DownloaderGui
 
             try
             {
-                _downloadTemporaryDirectory = DownloadTemporaryStore.Create();
+                if (resumeExistingTask)
+                {
+                    if (string.IsNullOrWhiteSpace(_downloadTemporaryDirectory) ||
+                        !Directory.Exists(_downloadTemporaryDirectory))
+                    {
+                        throw new DirectoryNotFoundException("可恢复的下载缓存已经不存在。");
+                    }
+                }
+                else
+                {
+                    _downloadTemporaryDirectory = DownloadTemporaryStore.Create();
+                    _downloadResumeManifest = null;
+                }
             }
             catch (Exception exception)
             {
@@ -2028,8 +2959,82 @@ namespace M3u8DownloaderGui
                 return;
             }
 
+            string leaseError;
+            if (!EnsureDownloadResumeLease(out leaseError))
+            {
+                DeleteTemporarySecrets();
+                if (!resumeExistingTask)
+                {
+                    DeleteDownloadTemporaryDirectory();
+                }
+
+                ShowError("无法锁定可恢复任务缓存：\r\n\r\n" + leaseError);
+                return;
+            }
+
+            string canonicalInputError;
+            if (!TryCanonicalizeImportedInput(request, out canonicalInputError))
+            {
+                DeleteTemporarySecrets();
+                if (!resumeExistingTask)
+                {
+                    DeleteDownloadTemporaryDirectory();
+                }
+                ShowError(
+                    "无法把导入的播放列表保存到任务缓存：\r\n\r\n" +
+                    canonicalInputError);
+                return;
+            }
+
+            string effectiveInput;
+            string mediaTransportError;
+            if (!TryPrepareCurlMediaTransport(request, out effectiveInput, out mediaTransportError))
+            {
+                StopActiveMediaProxy();
+                DeleteTemporarySecrets();
+                _downloadTaskState = DownloadTaskState.Failed;
+                _resumableRequest = request;
+                string persistError;
+                if (TryPersistDownloadResume(
+                    request,
+                    DownloadResumeState.Failed,
+                    out persistError))
+                {
+                    DeleteSupersededImportedPlaylist();
+                }
+                else
+                {
+                    AppendLog("[GUI] 无法更新重启恢复信息：" + persistError);
+                }
+                _statusLabel.Text = "下载准备失败，播放列表与缓存已保留";
+                UpdateDownloadActionButtons();
+
+                ShowError("无法准备受保护分片传输：\r\n\r\n" + mediaTransportError);
+                return;
+            }
+
+            string resumeSaveError;
+            if (!TryPersistDownloadResume(
+                request,
+                DownloadResumeState.Running,
+                out resumeSaveError))
+            {
+                StopActiveMediaProxy();
+                DeleteTemporarySecrets();
+                _downloadTaskState = DownloadTaskState.Failed;
+                _resumableRequest = request;
+                _statusLabel.Text = "无法保存重启续传信息，任务未启动";
+                UpdateDownloadActionButtons();
+
+                ShowError(
+                    "无法保存重启续传信息，因此没有启动下载：\r\n\r\n" +
+                    resumeSaveError);
+                return;
+            }
+            DeleteSupersededImportedPlaylist();
+
             List<string> arguments = new List<string>();
-            arguments.Add(request.Input);
+            arguments.Add(effectiveInput);
             arguments.Add("--save-dir");
             arguments.Add(request.SaveDirectory);
             arguments.Add("--save-name");
@@ -2044,6 +3049,8 @@ namespace M3u8DownloaderGui
             arguments.Add("--no-ansi-color");
             arguments.Add("--no-log");
             arguments.Add("--write-meta-json");
+            arguments.Add("false");
+            arguments.Add("--del-after-done");
             arguments.Add("false");
             arguments.Add("--disable-update-check");
 
@@ -2062,6 +3069,15 @@ namespace M3u8DownloaderGui
             {
                 arguments.Add("-M");
                 arguments.Add("format=mp4");
+            }
+
+            if (_activeMediaProxy != null)
+            {
+                AppendCurlTransportDownloaderArguments(arguments);
+            }
+            else
+            {
+                AppendCapturedHeaderArguments(arguments, request.CapturedHeaders);
             }
 
             ProcessStartInfo startInfo = new ProcessStartInfo();
@@ -2087,7 +3103,10 @@ namespace M3u8DownloaderGui
             process.EnableRaisingEvents = false;
 
             _isCancelling = false;
+            _isPausing = false;
             _activeOperation = OperationKind.Download;
+            _downloadTaskState = DownloadTaskState.Running;
+            _resumableRequest = request;
             _activeOperationDirectory = request.SaveDirectory;
             _lastOutputPath = null;
             _expectedOutputBaseName = request.FileName;
@@ -2101,7 +3120,23 @@ namespace M3u8DownloaderGui
             AppendLog("[GUI] 开始任务：" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss"));
             AppendLog("[GUI] 保存目录：" + request.SaveDirectory);
             AppendLog("[GUI] 文件名称：" + request.FileName);
+            AppendLog("[GUI] 分片缓存：" + _downloadTemporaryDirectory);
+            if (request.CapturedHeaders != null && request.CapturedHeaders.HasAny)
+            {
+                AppendLog("[GUI] 已捕获浏览器请求头：" +
+                          DescribeCapturedHeaderNames(request.CapturedHeaders));
+                if (!string.IsNullOrWhiteSpace(request.CapturedHeaders.Referer))
+                {
+                    AppendLog("[GUI] 分片 Referer：" +
+                              DescribeRefererForLog(request.CapturedHeaders.Referer));
+                }
+            }
+            if (resumeExistingTask)
+            {
+                AppendLog("[GUI] 继续已有任务；下载器将校验缓存并补下缺失分片。");
+            }
             _statusLabel.Text = "正在启动下载程序...";
+            UpdateDownloadActionButtons();
 
             bool processStarted = false;
             bool exitMonitoringEnabled = false;
@@ -2115,17 +3150,18 @@ namespace M3u8DownloaderGui
                 StartDownloadOutputCapture(process);
 
                 ProcessJob job = ProcessJob.TryCreateKillOnClose();
-                if (job != null)
+                if (job == null)
                 {
-                    if (job.AddProcess(process))
-                    {
-                        _processJob = job;
-                    }
-                    else
-                    {
-                        job.Dispose();
-                    }
+                    throw new InvalidOperationException(
+                        "无法创建下载进程保护 Job，已停止任务以避免重启后两个下载器共用缓存。");
                 }
+                if (!job.AddProcess(process))
+                {
+                    job.Dispose();
+                    throw new InvalidOperationException(
+                        "无法把下载器加入进程保护 Job，已停止任务以保护分片缓存。");
+                }
+                _processJob = job;
 
                 process.Exited += ProcessExited;
                 process.EnableRaisingEvents = true;
@@ -2165,6 +3201,7 @@ namespace M3u8DownloaderGui
                 ClearDownloadOutputCapture(process);
                 _activeProcess = null;
                 DisposeProcessJob();
+                StopActiveMediaProxy();
                 try
                 {
                     process.Dispose();
@@ -2173,15 +3210,399 @@ namespace M3u8DownloaderGui
                 {
                 }
 
-                SetRunningState(false);
-                _statusLabel.Text = "启动失败";
-                if (!DeleteDownloadTemporaryDirectory())
+                _downloadTaskState = DownloadTaskState.Failed;
+                _resumableRequest = request;
+                string persistError;
+                if (!TryPersistDownloadResume(
+                    request,
+                    DownloadResumeState.Failed,
+                    out persistError))
                 {
-                    AppendLog("[GUI] 警告：下载临时目录仍被占用，将在下次任务时重试清理。");
+                    AppendLog("[GUI] 无法更新重启恢复信息：" + persistError);
                 }
-                DeleteImportedPlaylist();
+                SetRunningState(false);
+                _statusLabel.Text = "启动失败，缓存已保留";
+                AppendLog("[GUI] 任务缓存已保留，可点击“重试下载”。");
                 DeleteTemporarySecrets();
+                UpdateDownloadActionButtons();
                 ShowError("无法启动下载程序：\r\n\r\n" + exception.Message);
+            }
+        }
+
+        internal static void AppendCapturedHeaderArguments(
+            IList<string> arguments,
+            MediaRequestHeaders headers)
+        {
+            if (arguments == null || headers == null)
+            {
+                return;
+            }
+
+            AppendHeaderArgument(arguments, "Cookie", headers.Cookie);
+            AppendHeaderArgument(arguments, "Referer", headers.Referer);
+            AppendHeaderArgument(arguments, "User-Agent", headers.UserAgent);
+            AppendHeaderArgument(arguments, "Origin", headers.Origin);
+            AppendHeaderArgument(arguments, "Authorization", headers.Authorization);
+
+            List<string> names = new List<string>(headers.AdditionalHeaders.Keys);
+            names.Sort(StringComparer.OrdinalIgnoreCase);
+            foreach (string name in names)
+            {
+                string value = headers.AdditionalHeaders[name];
+                if (MediaRequestHeaders.IsAllowedAdditionalHeader(name, value))
+                {
+                    AppendHeaderArgument(arguments, name, value);
+                }
+            }
+        }
+
+        internal static void AppendCurlTransportDownloaderArguments(IList<string> arguments)
+        {
+            if (arguments == null)
+            {
+                return;
+            }
+
+            arguments.Add("--use-system-proxy");
+            arguments.Add("false");
+            arguments.Add("--thread-count");
+            arguments.Add("4");
+            arguments.Add("--download-retry-count");
+            arguments.Add("10");
+            arguments.Add("--http-request-timeout");
+            arguments.Add("660");
+        }
+
+        private static void AppendHeaderArgument(
+            IList<string> arguments,
+            string name,
+            string value)
+        {
+            if (string.IsNullOrWhiteSpace(value))
+            {
+                return;
+            }
+
+            arguments.Add("-H");
+            arguments.Add(name + ": " + value);
+        }
+
+        internal static string DescribeCapturedHeaderNames(MediaRequestHeaders headers)
+        {
+            if (headers == null || !headers.HasAny)
+            {
+                return "无";
+            }
+
+            List<string> names = new List<string>();
+            if (!string.IsNullOrWhiteSpace(headers.Cookie))
+            {
+                names.Add("Cookie");
+            }
+
+            if (!string.IsNullOrWhiteSpace(headers.Referer))
+            {
+                names.Add("Referer");
+            }
+
+            if (!string.IsNullOrWhiteSpace(headers.UserAgent))
+            {
+                names.Add("User-Agent");
+            }
+
+            if (!string.IsNullOrWhiteSpace(headers.Origin))
+            {
+                names.Add("Origin");
+            }
+
+            if (!string.IsNullOrWhiteSpace(headers.Authorization))
+            {
+                names.Add("Authorization");
+            }
+
+            List<string> additionalNames = new List<string>(headers.AdditionalHeaders.Keys);
+            additionalNames.Sort(StringComparer.OrdinalIgnoreCase);
+            names.AddRange(additionalNames);
+            return string.Join(", ", names.ToArray());
+        }
+
+        internal static string DescribeRefererForLog(string referer)
+        {
+            Uri uri;
+            if (!Uri.TryCreate(referer, UriKind.Absolute, out uri) ||
+                (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps))
+            {
+                return "[已捕获，格式不可显示]";
+            }
+
+            return uri.GetLeftPart(UriPartial.Path);
+        }
+
+        private bool TryPrepareCurlMediaTransport(
+            DownloadRequest request,
+            out string effectiveInput,
+            out string errorMessage)
+        {
+            effectiveInput = request == null ? null : request.Input;
+            errorMessage = null;
+            if (request == null || string.IsNullOrWhiteSpace(request.Input) ||
+                !File.Exists(request.Input))
+            {
+                return true;
+            }
+
+            string playlistContent;
+            try
+            {
+                playlistContent = File.ReadAllText(request.Input, Encoding.UTF8);
+            }
+            catch (Exception exception)
+            {
+                errorMessage = "无法读取本地播放列表：" + exception.Message;
+                return false;
+            }
+
+            if (!RequiresCurlMediaTransport(playlistContent) &&
+                !RequiresCapturedHeaderIsolation(request.CapturedHeaders))
+            {
+                return true;
+            }
+
+            Uri observedSegmentUri;
+            if (request.CapturedHeaders == null ||
+                !Uri.TryCreate(
+                    request.CapturedHeaders.SourceUrl,
+                    UriKind.Absolute,
+                    out observedSegmentUri) ||
+                (observedSegmentUri.Scheme != Uri.UriSchemeHttp &&
+                 observedSegmentUri.Scheme != Uri.UriSchemeHttps))
+            {
+                errorMessage =
+                    "该播放列表的 CDN 会校验浏览器请求，但程序尚未观察到真实分片。\r\n" +
+                    "请重新点击“从网页捕获”，在内嵌浏览器中播放几秒，看到“已捕获真实分片请求”后再选择。";
+                return false;
+            }
+
+            HlsPlaylistInspection inspection = HlsPlaylistInspector.Inspect(
+                playlistContent,
+                request.Input);
+            if (inspection.SegmentCount == 0 || ContainsNestedPlaylistResource(inspection))
+            {
+                errorMessage =
+                    "当前捕获项仍是主播放列表或包含尚未展开的媒体子列表。\r\n" +
+                    "请返回捕获窗口继续播放，选择实际列出 .ts/.m4s/.jpeg 分片的媒体播放列表。";
+                return false;
+            }
+
+            string curlError;
+            if (!CurlMediaProxy.IsCurlAvailable(out curlError))
+            {
+                errorMessage = curlError;
+                return false;
+            }
+
+            CurlMediaProxy proxy = null;
+            try
+            {
+                MediaRequestHeaders transportHeaders = request.CapturedHeaders.Clone();
+                if (string.IsNullOrWhiteSpace(transportHeaders.UserAgent))
+                {
+                    transportHeaders.UserAgent =
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) M3U8-Video-Downloader";
+                }
+
+                proxy = CurlMediaProxy.Start(
+                    _downloadTemporaryDirectory,
+                    transportHeaders,
+                    AppendLog);
+                int resourceCount = 0;
+                string rewritten = HlsPlaylistInspector.RewriteReferences(
+                    playlistContent,
+                    request.Input,
+                    delegate(string url)
+                    {
+                        Uri uri;
+                        if (!Uri.TryCreate(url, UriKind.Absolute, out uri) ||
+                            (uri.Scheme != Uri.UriSchemeHttp &&
+                             uri.Scheme != Uri.UriSchemeHttps))
+                        {
+                            return url;
+                        }
+
+                        resourceCount++;
+                        return proxy.Register(url);
+                    });
+
+                if (resourceCount == 0)
+                {
+                    proxy.Dispose();
+                    return true;
+                }
+
+                string proxyPlaylistPath = Path.Combine(
+                    _downloadTemporaryDirectory,
+                    "browser_transport.m3u8");
+                File.WriteAllText(proxyPlaylistPath, rewritten, new UTF8Encoding(false));
+                _activeMediaProxy = proxy;
+                effectiveInput = proxyPlaylistPath;
+                AppendLog(
+                    "[GUI] 已启用隔离浏览器凭据的 Windows cURL 回环传输，共 " +
+                    resourceCount.ToString(CultureInfo.InvariantCulture) +
+                    " 个播放列表资源。N_m3u8DL-RE 仅连接 127.0.0.1 并继续负责缓存与合并。");
+                return true;
+            }
+            catch (Exception exception)
+            {
+                if (proxy != null)
+                {
+                    proxy.Dispose();
+                }
+
+                errorMessage = exception.Message;
+                return false;
+            }
+        }
+
+        internal static bool RequiresCurlMediaTransport(string playlistContent)
+        {
+            if (!PlaylistInput.LooksLikePlaylistContent(playlistContent))
+            {
+                return false;
+            }
+
+            if (ContainsPrivateTokenTag(playlistContent))
+            {
+                return true;
+            }
+
+            HlsPlaylistInspection inspection = HlsPlaylistInspector.Inspect(
+                playlistContent,
+                null);
+            foreach (HlsPlaylistResource resource in inspection.Resources)
+            {
+                Uri uri;
+                if (!Uri.TryCreate(resource.Url, UriKind.Absolute, out uri))
+                {
+                    continue;
+                }
+
+                if (string.Equals(uri.Host, "surrit.com", StringComparison.OrdinalIgnoreCase) ||
+                    uri.Host.EndsWith(".surrit.com", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        internal static bool RequiresCapturedHeaderIsolation(MediaRequestHeaders headers)
+        {
+            return headers != null &&
+                (!string.IsNullOrWhiteSpace(headers.Cookie) ||
+                 !string.IsNullOrWhiteSpace(headers.Authorization) ||
+                 headers.AdditionalHeaders.Count > 0);
+        }
+
+        internal static bool ContainsPrivateTokenTag(string playlistContent)
+        {
+            if (string.IsNullOrEmpty(playlistContent))
+            {
+                return false;
+            }
+
+            string[] lines = playlistContent.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+            foreach (string rawLine in lines)
+            {
+                string line = rawLine.Trim();
+                if (string.Equals(line, "#EXT-X-TOKEN", StringComparison.OrdinalIgnoreCase) ||
+                    line.StartsWith("#EXT-X-TOKEN=", StringComparison.OrdinalIgnoreCase) ||
+                    line.StartsWith("#EXT-X-TOKEN:", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool ContainsNestedPlaylistResource(HlsPlaylistInspection inspection)
+        {
+            if (inspection == null)
+            {
+                return false;
+            }
+
+            foreach (HlsPlaylistResource resource in inspection.Resources)
+            {
+                if (resource == null || resource.SegmentNumber > 0)
+                {
+                    continue;
+                }
+
+                if (string.Equals(resource.Kind, "子播放列表", StringComparison.Ordinal) ||
+                    string.Equals(resource.Kind, "媒体轨道", StringComparison.Ordinal) ||
+                    string.Equals(resource.Kind, "I 帧播放列表", StringComparison.Ordinal))
+                {
+                    return true;
+                }
+
+                Uri uri;
+                if (Uri.TryCreate(resource.Url, UriKind.Absolute, out uri) &&
+                    uri.AbsolutePath.IndexOf(".m3u8", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private void StopActiveMediaProxy()
+        {
+            CurlMediaProxy proxy = _activeMediaProxy;
+            _activeMediaProxy = null;
+            if (proxy != null)
+            {
+                try
+                {
+                    proxy.Dispose();
+                }
+                catch (Exception exception)
+                {
+                    AppendLog("[GUI] 清理 cURL 回环传输时发生错误：" + exception.Message);
+                }
+            }
+            DeleteBrowserTransportPlaylist(_downloadTemporaryDirectory);
+        }
+
+        private static void DeleteBrowserTransportPlaylist(string cacheDirectory)
+        {
+            string ownedDirectory;
+            string taskId;
+            if (!DownloadResumeStore.TryGetOwnedCacheDirectory(
+                cacheDirectory,
+                out ownedDirectory,
+                out taskId))
+            {
+                return;
+            }
+
+            try
+            {
+                string path = Path.Combine(ownedDirectory, "browser_transport.m3u8");
+                if (File.Exists(path))
+                {
+                    FileAttributes attributes = File.GetAttributes(path);
+                    if ((attributes & FileAttributes.ReadOnly) != 0)
+                    {
+                        File.SetAttributes(path, attributes & ~FileAttributes.ReadOnly);
+                    }
+                    File.Delete(path);
+                }
+            }
+            catch
+            {
             }
         }
 
@@ -2291,7 +3712,54 @@ namespace M3u8DownloaderGui
 
         private void HandleDownloaderLogRecord(string record)
         {
-            AppendLog(RedactSecrets(record));
+            string redacted = RedactSecrets(record);
+            string error = ExtractDownloaderFailureSummary(redacted, false);
+            if (!string.IsNullOrWhiteSpace(error))
+            {
+                _lastDownloaderError = error;
+            }
+            else
+            {
+                string warning = ExtractDownloaderFailureSummary(redacted, true);
+                if (!string.IsNullOrWhiteSpace(warning))
+                {
+                    _lastDownloaderWarning = warning;
+                }
+            }
+
+            AppendLog(redacted);
+        }
+
+        internal static string ExtractDownloaderFailureSummary(string record, bool includeWarnings)
+        {
+            if (string.IsNullOrWhiteSpace(record))
+            {
+                return null;
+            }
+
+            bool isError = DownloaderErrorSeverity.IsMatch(record);
+            bool isWarning = includeWarnings && DownloaderWarningSeverity.IsMatch(record);
+            if (!isError && !isWarning)
+            {
+                return null;
+            }
+
+            string summary = DownloaderLogPrefix.Replace(record.Trim(), string.Empty, 1);
+            summary = Regex.Replace(summary, @"\s+", " ").Trim();
+            const int maximumSummaryLength = 500;
+            if (summary.Length > maximumSummaryLength)
+            {
+                summary = summary.Substring(0, maximumSummaryLength) + "…";
+            }
+
+            return summary;
+        }
+
+        private string GetLastDownloaderFailureSummary()
+        {
+            return !string.IsNullOrWhiteSpace(_lastDownloaderError)
+                ? _lastDownloaderError
+                : _lastDownloaderWarning;
         }
 
         private void QueueDownloadProgress(ExternalToolProgress progress)
@@ -2386,6 +3854,30 @@ namespace M3u8DownloaderGui
                 }
             }
 
+            if (_capturedHeaders != null)
+            {
+                if (!string.IsNullOrWhiteSpace(_capturedHeaders.Cookie))
+                {
+                    result = result.Replace(_capturedHeaders.Cookie, "[COOKIE HIDDEN]");
+                }
+
+                if (!string.IsNullOrWhiteSpace(_capturedHeaders.Authorization))
+                {
+                    result = result.Replace(_capturedHeaders.Authorization, "[AUTHORIZATION HIDDEN]");
+                }
+
+                foreach (KeyValuePair<string, string> header in
+                         _capturedHeaders.AdditionalHeaders)
+                {
+                    if (!string.IsNullOrWhiteSpace(header.Value))
+                    {
+                        result = result.Replace(
+                            header.Value,
+                            "[CAPTURED HEADER HIDDEN]");
+                    }
+                }
+            }
+
             return result;
         }
 
@@ -2433,7 +3925,8 @@ namespace M3u8DownloaderGui
                 return;
             }
 
-            bool wasCancelled = _isCancelling;
+            bool wasPausing = _isPausing;
+            bool wasCancelled = _isCancelling && !wasPausing;
             OperationKind completedOperation = _activeOperation;
             bool isConversion = completedOperation == OperationKind.ConvertFile;
             string saveDirectory = string.IsNullOrWhiteSpace(_activeOperationDirectory)
@@ -2443,7 +3936,9 @@ namespace M3u8DownloaderGui
             FlushPendingOutput();
             ClearDownloadOutputCapture(completedProcess);
             _activeProcess = null;
+            StopActiveMediaProxy();
             _isCancelling = false;
+            _isPausing = false;
             _activeOperationDirectory = null;
             while (!_pendingLogLines.IsEmpty)
             {
@@ -2464,6 +3959,7 @@ namespace M3u8DownloaderGui
 
             string output = null;
             string conversionCommitError = null;
+            bool preserveDownloadCache = false;
             if (isConversion)
             {
                 if (exitCode == 0 && !wasCancelled)
@@ -2481,7 +3977,10 @@ namespace M3u8DownloaderGui
             else
             {
                 output = FindChangedOutput(saveDirectory);
-                if (!DeleteDownloadTemporaryDirectory())
+                bool downloadSucceeded = exitCode == 0 && output != null;
+                preserveDownloadCache = !downloadSucceeded &&
+                    (wasPausing || !wasCancelled);
+                if (!preserveDownloadCache && !DeleteDownloadTemporaryDirectory())
                 {
                     AppendLog("[GUI] 警告：下载临时目录仍被占用，将在下次任务时重试清理。");
                 }
@@ -2490,8 +3989,11 @@ namespace M3u8DownloaderGui
             _lastOutputPath = output;
             if (!isConversion)
             {
-                DeleteImportedPlaylist();
                 DeleteTemporarySecrets();
+                if (!preserveDownloadCache)
+                {
+                    DeleteImportedPlaylist();
+                }
             }
 
             if (!string.IsNullOrWhiteSpace(conversionCommitError))
@@ -2509,11 +4011,28 @@ namespace M3u8DownloaderGui
                 return;
             }
 
+            if (!isConversion && wasPausing && !(exitCode == 0 && output != null))
+            {
+                _downloadTaskState = DownloadTaskState.Paused;
+                PersistDownloadResumeOrLog(DownloadResumeState.Paused);
+                _statusLabel.Text = "下载已暂停，分片缓存已保留";
+                AppendLog("[GUI] 下载已暂停。缓存保留在：" + _downloadTemporaryDirectory);
+                UpdateDownloadActionButtons();
+                return;
+            }
+
             if (wasCancelled && !(exitCode == 0 && output != null))
             {
+                if (!isConversion)
+                {
+                    _downloadTaskState = DownloadTaskState.Idle;
+                    ClearCapturedHeadersForRequest(_resumableRequest);
+                    _resumableRequest = null;
+                }
                 _progressBar.Value = 0;
                 _statusLabel.Text = "任务已取消";
                 AppendLog("[GUI] 任务已取消。");
+                UpdateDownloadActionButtons();
                 return;
             }
 
@@ -2525,9 +4044,14 @@ namespace M3u8DownloaderGui
             if (exitCode == 0 && output != null)
             {
                 string completedText = isConversion ? "转换完成" : "下载完成";
+                if (!isConversion)
+                {
+                    _downloadTaskState = DownloadTaskState.Completed;
+                }
                 _progressBar.Value = 100;
                 _statusLabel.Text = completedText + "：" + Path.GetFileName(output);
                 AppendLog("[GUI] " + completedText + "：" + output);
+                UpdateDownloadActionButtons();
 
                 if (_openFolderWhenDoneCheckBox.Checked)
                 {
@@ -2545,25 +4069,71 @@ namespace M3u8DownloaderGui
 
             if (exitCode == 0)
             {
-                _progressBar.Value = 100;
-                _statusLabel.Text = "任务结束，请打开保存目录查看结果";
+                if (!isConversion)
+                {
+                    _downloadTaskState = DownloadTaskState.Failed;
+                    PersistDownloadResumeOrLog(DownloadResumeState.Failed);
+                }
+                else
+                {
+                    _progressBar.Value = 100;
+                }
+                _statusLabel.Text = isConversion
+                    ? "任务结束，请打开保存目录查看结果"
+                    : "未识别到成品，分片缓存已保留";
                 AppendLog("[GUI] 进程已正常结束，但没有识别到新生成的媒体文件。");
+                if (!isConversion)
+                {
+                    AppendLog("[GUI] 缓存保留在：" + _downloadTemporaryDirectory);
+                    AppendLog("[GUI] 可点击“重试下载”继续校验并补下分片。");
+                }
+                UpdateDownloadActionButtons();
                 MessageBox.Show(
                     this,
-                    "任务已经结束，但程序没有识别到新生成的媒体文件。请打开保存目录并查看运行日志。",
+                    "任务已经结束，但程序没有识别到新生成的媒体文件。\r\n\r\n" +
+                    (isConversion
+                        ? "请打开保存目录并查看运行日志。"
+                        : "分片缓存已保留，可点击“重试下载”继续。"),
                     "请检查结果",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Warning);
                 return;
             }
 
-            _progressBar.Value = 0;
             string failureText = isConversion ? "转换失败" : "下载失败";
-            _statusLabel.Text = failureText + "，退出代码 " + exitCode;
+            string failureSummary = isConversion ? null : GetLastDownloaderFailureSummary();
+            if (!isConversion)
+            {
+                _downloadTaskState = DownloadTaskState.Failed;
+                PersistDownloadResumeOrLog(DownloadResumeState.Failed);
+            }
+            else
+            {
+                _progressBar.Value = 0;
+            }
+            _statusLabel.Text = isConversion
+                ? failureText + "，退出代码 " + exitCode
+                : failureText + "，分片缓存已保留";
             AppendLog("[GUI] " + failureText + "，退出代码：" + exitCode);
+            if (!string.IsNullOrWhiteSpace(failureSummary))
+            {
+                AppendLog("[GUI] 下载器最后错误：" + failureSummary);
+            }
+            if (!isConversion)
+            {
+                AppendLog("[GUI] 缓存保留在：" + _downloadTemporaryDirectory);
+                AppendLog("[GUI] 修复上述错误后点击“重试下载”，只补缺失分片。");
+            }
+            UpdateDownloadActionButtons();
+            string failureDetails = string.IsNullOrWhiteSpace(failureSummary)
+                ? "请查看运行日志中失败前的最后几行。"
+                : "下载器最后错误：\r\n" + failureSummary;
             MessageBox.Show(
                 this,
-                failureText + "，退出代码：" + exitCode + "。\r\n\r\n请查看运行日志中的最后几行。",
+                failureText + "，退出代码：" + exitCode + "。\r\n\r\n" +
+                (isConversion
+                    ? "请查看运行日志中的最后几行。"
+                    : failureDetails + "\r\n\r\n分片缓存已保留；修复该错误后点击“重试下载”即可继续。"),
                 failureText,
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Error);
@@ -2864,6 +4434,32 @@ namespace M3u8DownloaderGui
 
             if (_activeProcess == null)
             {
+                if (_downloadTaskState != DownloadTaskState.Paused &&
+                    _downloadTaskState != DownloadTaskState.Failed)
+                {
+                    return;
+                }
+
+                DialogResult clearResult = MessageBox.Show(
+                    this,
+                    "确定要放弃当前任务并删除已下载的分片缓存吗？",
+                    "清除任务缓存",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning,
+                    MessageBoxDefaultButton.Button2);
+                if (clearResult == DialogResult.Yes)
+                {
+                    if (!DiscardResumableDownload())
+                    {
+                        ShowError("任务缓存仍被占用，暂时无法删除。");
+                        return;
+                    }
+
+                    DeleteImportedPlaylist();
+                    _statusLabel.Text = "任务已取消，缓存已清理";
+                    AppendLog("[GUI] 已放弃任务并清理分片缓存。");
+                    UpdateDownloadActionButtons();
+                }
                 return;
             }
 
@@ -2876,11 +4472,11 @@ namespace M3u8DownloaderGui
                 MessageBoxDefaultButton.Button2);
             if (result == DialogResult.Yes)
             {
-                CancelActiveProcess();
+                StopActiveProcess(false);
             }
         }
 
-        private void CancelActiveProcess()
+        private void StopActiveProcess(bool preserveForResume)
         {
             Process process = _activeProcess;
             if (process == null)
@@ -2897,10 +4493,14 @@ namespace M3u8DownloaderGui
                     return;
                 }
 
+                _isPausing = preserveForResume;
                 _isCancelling = true;
                 _cancelButton.Enabled = false;
-                _statusLabel.Text = "正在取消任务...";
-                AppendLog("[GUI] 正在取消任务...");
+                _statusLabel.Text = preserveForResume ? "正在暂停下载..." : "正在取消任务...";
+                AppendLog(preserveForResume
+                    ? "[GUI] 正在暂停下载并保留分片缓存..."
+                    : "[GUI] 正在取消任务...");
+                UpdateDownloadActionButtons();
 
                 ProcessJob job = TakeProcessJob();
                 if (job != null)
@@ -2971,9 +4571,15 @@ namespace M3u8DownloaderGui
                             SafeBeginInvoke(delegate
                             {
                                 _isCancelling = false;
+                                _isPausing = false;
                                 _cancelButton.Enabled = true;
-                                _statusLabel.Text = "取消失败，任务仍在运行";
-                                AppendLog("[GUI] 无法终止下载进程，请重试或关闭程序。");
+                                _statusLabel.Text = preserveForResume
+                                    ? "暂停失败，任务仍在运行"
+                                    : "取消失败，任务仍在运行";
+                                AppendLog(preserveForResume
+                                    ? "[GUI] 无法暂停下载进程，请重试。"
+                                    : "[GUI] 无法终止下载进程，请重试或关闭程序。");
+                                UpdateDownloadActionButtons();
                             });
                         }
                     });
@@ -2984,7 +4590,8 @@ namespace M3u8DownloaderGui
             }
             catch (Exception exception)
             {
-                AppendLog("[GUI] 取消任务时发生错误：" + exception.Message);
+                AppendLog("[GUI] " + (preserveForResume ? "暂停" : "取消") +
+                    "任务时发生错误：" + exception.Message);
                 try
                 {
                     if (!process.HasExited)
@@ -3107,6 +4714,7 @@ namespace M3u8DownloaderGui
             _openFolderWhenDoneCheckBox.Enabled = !isRunning;
             SetSecondaryButtonEnabled(_keyOptionsButton, !isRunning);
             SetSecondaryButtonEnabled(_convertFileButton, !isRunning);
+            SetSecondaryButtonEnabled(_captureButton, !isRunning);
             _startButton.Enabled = !isRunning;
             _cancelButton.Enabled = isRunning;
 
@@ -3119,6 +4727,65 @@ namespace M3u8DownloaderGui
             {
                 _progressBar.MarqueeAnimationSpeed = 0;
                 _progressBar.Style = ProgressBarStyle.Blocks;
+            }
+
+            UpdateDownloadActionButtons();
+        }
+
+        private void UpdateDownloadActionButtons()
+        {
+            if (_startButton == null || _cancelButton == null)
+            {
+                return;
+            }
+
+            if (_dependencyInstallInProgress || _toolDetectionInProgress)
+            {
+                return;
+            }
+
+            if (_activeProcess != null)
+            {
+                if (_activeOperation == OperationKind.Download)
+                {
+                    _startButton.Enabled = !_isCancelling;
+                    _startButton.Text = _isPausing ? "正在暂停..." : "暂停";
+                    _cancelButton.Enabled = !_isCancelling;
+                    _cancelButton.Text = "取消";
+                }
+                else
+                {
+                    _startButton.Enabled = false;
+                    _cancelButton.Enabled = true;
+                    _cancelButton.Text = "取消";
+                }
+                return;
+            }
+
+            _startButton.Enabled = true;
+            _cancelButton.Text = "取消";
+            switch (_downloadTaskState)
+            {
+                case DownloadTaskState.Paused:
+                    _startButton.Text = "继续";
+                    _cancelButton.Text = "清除缓存";
+                    _cancelButton.Enabled = true;
+                    break;
+                case DownloadTaskState.Failed:
+                    _startButton.Text = "重试下载";
+                    _cancelButton.Text = "清除缓存";
+                    _cancelButton.Enabled = true;
+                    break;
+                case DownloadTaskState.Completed:
+                    _startButton.Text = "完成";
+                    _cancelButton.Enabled = false;
+                    break;
+                default:
+                    _startButton.Text = string.IsNullOrWhiteSpace(_manualHlsKey)
+                        ? "开始下载"
+                        : "使用密钥下载";
+                    _cancelButton.Enabled = false;
+                    break;
             }
         }
 
@@ -3134,6 +4801,7 @@ namespace M3u8DownloaderGui
             _detectToolsButton.Enabled = enabled;
             _startButton.Enabled = enabled;
             SetSecondaryButtonEnabled(_convertFileButton, enabled);
+            UpdateDownloadActionButtons();
         }
 
         private void SetSecondaryButtonEnabled(Button button, bool enabled)
@@ -3177,6 +4845,43 @@ namespace M3u8DownloaderGui
             catch (Exception exception)
             {
                 ShowError("无法打开保存目录：" + exception.Message);
+            }
+        }
+
+        private void CaptureButtonClick(object sender, EventArgs e)
+        {
+            if (!WebView2Runtime.EnsureAvailable(this))
+            {
+                return;
+            }
+
+            string initialUrl = _urlTextBox.Text.Trim();
+            if (!initialUrl.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
+                !initialUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+            {
+                initialUrl = string.Empty;
+            }
+
+            using (CaptureBrowserForm form = new CaptureBrowserForm(initialUrl))
+            {
+                if (form.ShowDialog(this) != DialogResult.OK || form.Result == null)
+                {
+                    return;
+                }
+
+                CaptureResult result = form.Result;
+                _capturedHeaders = result.Headers;
+                if (PlaylistInput.LooksLikePlaylistContent(result.PlaylistContent))
+                {
+                    ImportPlaylistContent(
+                        result.PlaylistContent,
+                        result.IsBlob ? "网页捕获的 Blob" : "网页捕获的 m3u8 正文");
+                    return;
+                }
+
+                _urlTextBox.Text = result.Url;
+                _fileNameWasEdited = false;
+                ApplyAutomaticName(false);
             }
         }
 
@@ -3243,9 +4948,34 @@ namespace M3u8DownloaderGui
             Process processToStop = _activeProcess;
             if (processToStop != null)
             {
+                try
+                {
+                    processToStop.Refresh();
+                    if (processToStop.HasExited)
+                    {
+                        int completedExitCode = processToStop.ExitCode;
+                        FinishDownload(processToStop, completedExitCode);
+                        processToStop = _activeProcess;
+                    }
+                }
+                catch
+                {
+                }
+            }
+            bool stoppingRunningDownload = processToStop != null &&
+                _activeOperation == OperationKind.Download;
+            bool cancelWasAlreadyRequested = stoppingRunningDownload &&
+                _isCancelling && !_isPausing;
+            if (processToStop != null)
+            {
+                string closeMessage = cancelWasAlreadyRequested
+                    ? "下载正在取消。关闭窗口会完成取消并清理分片缓存。\r\n\r\n确定关闭吗？"
+                    : (stoppingRunningDownload
+                        ? "下载仍在运行。关闭窗口会暂停任务并保留分片缓存，下次打开新版可继续。\r\n\r\n确定关闭吗？"
+                        : "转换仍在运行。关闭窗口会取消转换，确定继续吗？");
                 DialogResult result = MessageBox.Show(
                     this,
-                    "任务仍在运行。关闭窗口会取消任务，确定继续吗？",
+                    closeMessage,
                     "任务正在运行",
                     MessageBoxButtons.YesNo,
                     MessageBoxIcon.Warning,
@@ -3256,12 +4986,40 @@ namespace M3u8DownloaderGui
                     return;
                 }
 
+                if (stoppingRunningDownload && !cancelWasAlreadyRequested)
+                {
+                    string persistError;
+                    if (!TryPersistDownloadResume(
+                        _resumableRequest,
+                        DownloadResumeState.Paused,
+                        out persistError))
+                    {
+                        MessageBox.Show(
+                            this,
+                            "无法保存重启续传信息，因此窗口暂不关闭。\r\n\r\n" + persistError,
+                            "无法保留下载任务",
+                            MessageBoxButtons.OK,
+                            MessageBoxIcon.Error);
+                        e.Cancel = true;
+                        return;
+                    }
+
+                    _downloadTaskState = DownloadTaskState.Paused;
+                    _isPausing = true;
+                }
+
                 _isCancelling = true;
                 _activeProcess = null;
                 if (!StopProcessForCleanup(processToStop, 5000))
                 {
                     _activeProcess = processToStop;
                     _isCancelling = false;
+                    if (stoppingRunningDownload && !cancelWasAlreadyRequested)
+                    {
+                        _isPausing = false;
+                        _downloadTaskState = DownloadTaskState.Running;
+                        PersistDownloadResumeOrLog(DownloadResumeState.Running);
+                    }
                     _cancelButton.Enabled = true;
                     _statusLabel.Text = "无法结束任务，窗口保持打开";
                     MessageBox.Show(
@@ -3285,6 +5043,33 @@ namespace M3u8DownloaderGui
                 }
             }
 
+            bool preserveDownloadForRestart =
+                _resumableRequest != null &&
+                !string.IsNullOrWhiteSpace(_downloadTemporaryDirectory) &&
+                Directory.Exists(_downloadTemporaryDirectory) &&
+                (_downloadTaskState == DownloadTaskState.Paused ||
+                 _downloadTaskState == DownloadTaskState.Failed);
+            if (preserveDownloadForRestart && !stoppingRunningDownload &&
+                _resumeTaskTouchedThisSession)
+            {
+                DownloadResumeState resumeState =
+                    _downloadTaskState == DownloadTaskState.Failed
+                        ? DownloadResumeState.Failed
+                        : DownloadResumeState.Paused;
+                if (!PersistDownloadResumeOrLog(resumeState) &&
+                    _downloadResumeManifest == null)
+                {
+                    MessageBox.Show(
+                        this,
+                        "无法保存重启续传信息，因此窗口暂不关闭。请先重试或点击“清除缓存”。",
+                        "无法保留下载任务",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                    e.Cancel = true;
+                    return;
+                }
+            }
+
             if (_logFlushTimer != null)
             {
                 _logFlushTimer.Stop();
@@ -3292,9 +5077,17 @@ namespace M3u8DownloaderGui
                 _logFlushTimer = null;
             }
 
-            DeleteImportedPlaylist();
+            StopActiveMediaProxy();
             DeleteTemporarySecrets();
-            DeleteDownloadTemporaryDirectory();
+            DeleteImportedPlaylist(false);
+            if (preserveDownloadForRestart)
+            {
+                ReleaseDownloadResumeLease();
+            }
+            else
+            {
+                DeleteDownloadTemporaryDirectory();
+            }
             DeleteConversionTemporaryOutput();
             SaveCurrentSettings();
         }
@@ -3304,13 +5097,30 @@ namespace M3u8DownloaderGui
             string path = _downloadTemporaryDirectory;
             if (string.IsNullOrWhiteSpace(path))
             {
+                ReleaseDownloadResumeLease();
+                _downloadResumeManifest = null;
                 return true;
             }
 
-            if (DownloadTemporaryStore.Delete(path))
+            ReleaseDownloadResumeLease();
+            if (!Directory.Exists(path))
             {
                 _downloadTemporaryDirectory = null;
+                _downloadResumeManifest = null;
                 return true;
+            }
+
+            string errorMessage;
+            if (DownloadResumeStore.TryDiscard(path, out errorMessage))
+            {
+                _downloadTemporaryDirectory = null;
+                _downloadResumeManifest = null;
+                return true;
+            }
+
+            if (!string.IsNullOrWhiteSpace(errorMessage))
+            {
+                AppendLog("[GUI] 缓存清理尚未完成：" + errorMessage);
             }
 
             return false;
@@ -3520,12 +5330,24 @@ namespace M3u8DownloaderGui
             public bool MuxToMp4;
             public string HlsKey;
             public string HlsIv;
+            public bool InputIsImportedPlaylist;
+            public string ImportedPlaylistContent;
+            public MediaRequestHeaders CapturedHeaders;
         }
 
         private enum OperationKind
         {
             Download,
             ConvertFile
+        }
+
+        private enum DownloadTaskState
+        {
+            Idle,
+            Running,
+            Paused,
+            Failed,
+            Completed
         }
 
         private enum DownloadPhase

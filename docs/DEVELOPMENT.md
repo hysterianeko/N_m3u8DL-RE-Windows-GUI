@@ -2,7 +2,7 @@
 
 ## Toolchain
 
-The application intentionally targets .NET Framework 4.8 and C# 5 so it can be built on a standard Windows installation without a .NET SDK, Visual Studio, NuGet restore, or network access.
+The application intentionally targets .NET Framework 4.8 and C# 5 so it can be built on a standard Windows installation without a .NET SDK, Visual Studio, or the NuGet CLI. If the WebView2 SDK files are not already available, the first build downloads the pinned official `Microsoft.Web.WebView2 1.0.2957.106` package and verifies the package and extracted DLL hashes. Later builds can reuse the verified local files without network access.
 
 Compiler:
 
@@ -30,6 +30,7 @@ Framework references:
 | `DependencyInstaller.cs` | Pinned direct GitHub downloads without the Windows system proxy, hash verification, controlled extraction, cancellation, atomic install |
 | `SelfTests.cs` | Dependency-free unit and platform tests |
 | `app.manifest` | DPI awareness, supported Windows versions, execution level |
+| `restore-webview2.ps1` | Pinned WebView2 SDK download, hash verification, and atomic local restore |
 | `build.ps1` | Deterministic compiler invocation and test runner |
 | `package.ps1` | Lightweight Windows release packaging and SHA-256 manifest |
 | `setup-dependencies.ps1` | Verified upstream downloader setup and optional WinGet FFmpeg install |
@@ -92,15 +93,15 @@ Current self-tests cover:
 - Settings/tool defaults through GUI smoke initialization.
 - Dependency catalog hashes, managed LocalAppData tool path, cancellable SHA-256, and controlled ZIP payload extraction.
 
-The GitHub Actions workflow builds and smoke-tests the application on `windows-latest` and uploads the EXE as a workflow artifact.
+The GitHub Actions workflow builds and smoke-tests the application on `windows-latest` and uploads the EXE together with its three WebView2 DLLs and their license/notice files as one workflow artifact.
 
 ## Package
 
 ```powershell
-.\package.ps1 -Version 1.2.3
+.\package.ps1 -Version 1.4.0
 ```
 
-This creates a standalone GUI EXE, a lightweight Windows ZIP, and `SHA256SUMS.txt` under `dist`. The ZIP intentionally does not redistribute N_m3u8DL-RE or FFmpeg binaries. It contains the verified dependency setup script and third-party notices instead.
+This creates a complete Windows ZIP and `SHA256SUMS.txt` under `dist`. The ZIP keeps the GUI EXE beside its three required WebView2 DLLs. It intentionally does not redistribute N_m3u8DL-RE or FFmpeg binaries, and contains the verified dependency setup script and third-party notices instead.
 
 ## Release checklist
 

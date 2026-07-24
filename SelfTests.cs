@@ -97,6 +97,472 @@ namespace M3u8DownloaderGui
             AssertTrue(
                 PlaylistInput.ContainsRelativeMediaReferences("#EXTM3U\n#EXT-X-MAP:URI=\"//cdn.example.com/init.mp4\"\nhttps://example.com/1.m4s"),
                 "scheme-relative HLS URI is detected");
+
+            string relativePlaylist =
+                "#EXTM3U\n" +
+                "#EXT-X-KEY:METHOD=AES-128,URI=\"keys/video.key\"\n" +
+                "#EXT-X-MAP:URI=\"init.mp4\"\n" +
+                "#EXTINF:4.5,开场\n" +
+                "segments/0001.ts\n" +
+                "#EXTINF:5,\n" +
+                "//cdn.example.com/video/0002.ts\n";
+            string absolutePlaylist = HlsPlaylistInspector.MakeReferencesAbsolute(
+                relativePlaylist,
+                "https://media.example.com/watch/index.html");
+            AssertTrue(
+                absolutePlaylist.IndexOf("URI=\"https://media.example.com/watch/keys/video.key\"", StringComparison.Ordinal) >= 0,
+                "blob playlist key URI is made absolute");
+            AssertTrue(
+                absolutePlaylist.IndexOf("URI=\"https://media.example.com/watch/init.mp4\"", StringComparison.Ordinal) >= 0,
+                "blob playlist map URI is made absolute");
+            AssertTrue(
+                absolutePlaylist.IndexOf("https://media.example.com/watch/segments/0001.ts", StringComparison.Ordinal) >= 0,
+                "blob playlist segment URI is made absolute");
+            AssertTrue(
+                absolutePlaylist.IndexOf("https://cdn.example.com/video/0002.ts", StringComparison.Ordinal) >= 0,
+                "scheme-relative blob segment receives the page scheme");
+            AssertEqual(
+                "https://cdn.example.com/video/0002.ts",
+                M3u8SizeProbe.ResolveUrl(
+                    "https://media.example.com/watch/index.m3u8",
+                    "//cdn.example.com/video/0002.ts"),
+                "shared HLS URL resolver inherits the HTTPS scheme");
+            AssertTrue(
+                !PlaylistInput.ContainsRelativeMediaReferences(absolutePlaylist),
+                "normalized blob playlist can be imported as a local file");
+
+            int rewrittenResourceCount = 0;
+            string proxyPlaylist = HlsPlaylistInspector.RewriteReferences(
+                relativePlaylist + "#EXT-X-TOKEN=private-value\n",
+                "https://media.example.com/watch/index.html",
+                delegate(string resolvedUrl)
+                {
+                    rewrittenResourceCount++;
+                    return "http://127.0.0.1:32100/resource/" +
+                           rewrittenResourceCount.ToString();
+                });
+            AssertTrue(rewrittenResourceCount == 4, "proxy rewrite visits every HLS resource");
+            AssertTrue(
+                proxyPlaylist.IndexOf(
+                    "#EXT-X-KEY:METHOD=AES-128,URI=\"http://127.0.0.1:32100/resource/1\"",
+                    StringComparison.Ordinal) >= 0,
+                "proxy rewrite covers URI attributes while preserving quotes");
+            AssertTrue(
+                proxyPlaylist.IndexOf("http://127.0.0.1:32100/resource/3", StringComparison.Ordinal) >= 0,
+                "proxy rewrite covers ordinary segment lines");
+            AssertTrue(
+                proxyPlaylist.IndexOf("#EXT-X-TOKEN=private-value", StringComparison.Ordinal) >= 0,
+                "proxy rewrite preserves private non-resource tags");
+            AssertTrue(
+                MainForm.RequiresCurlMediaTransport(proxyPlaylist),
+                "private token playlist enables browser-compatible curl transport");
+            AssertTrue(
+                MainForm.RequiresCurlMediaTransport(
+                    "#EXTM3U\n#EXTINF:4,\nhttps://surrit.com/id/video0.jpeg\n"),
+                "known client-fingerprint CDN enables curl transport");
+            AssertTrue(
+                !MainForm.RequiresCurlMediaTransport(
+                    "#EXTM3U\n#EXTINF:4,\nhttps://cdn.example.com/video0.ts\n"),
+                "ordinary captured playlist keeps the direct downloader path");
+            AssertTrue(
+                !MainForm.ContainsPrivateTokenTag(
+                    "#EXTM3U\n#EXT-X-TOKENIZER=not-a-token-tag\n"),
+                "private token detection requires a complete tag name");
+
+            HlsPlaylistInspection inspection = HlsPlaylistInspector.Inspect(
+                absolutePlaylist,
+                "https://media.example.com/watch/index.html");
+            AssertTrue(inspection.SegmentCount == 2, "playlist inspector counts media segments");
+            AssertTrue(inspection.Resources.Count == 4, "playlist inspector includes keys and initialization resources");
+            AssertTrue(
+                Math.Abs(inspection.TotalDurationSeconds - 9.5) < 0.0001,
+                "playlist inspector sums EXTINF durations");
+            AssertEqual("密钥", inspection.Resources[0].Kind, "playlist inspector preserves key order");
+            AssertEqual("初始化片段", inspection.Resources[1].Kind, "playlist inspector preserves map order");
+            AssertEqual("切片", inspection.Resources[2].Kind, "playlist inspector labels media segments");
+            AssertTrue(
+                inspection.Resources[2].Detail.IndexOf("4.5 秒", StringComparison.Ordinal) >= 0,
+                "playlist inspector exposes segment duration");
+
+            string masterPlaylist =
+                "#EXTM3U\n" +
+                "#EXT-X-STREAM-INF:BANDWIDTH=1000000,AVERAGE-BANDWIDTH=800000,RESOLUTION=1280x720\n" +
+                "media/video.m3u8\n";
+            List<MasterVariant> variants = M3u8SizeProbe.TryParseMaster(
+                "https://media.example.com/master/index.m3u8",
+                masterPlaylist);
+            AssertTrue(variants != null && variants.Count == 1, "master playlist variant is parsed");
+            AssertTrue(variants[0].Bandwidth == 1000000, "master peak bandwidth is preserved");
+            AssertTrue(variants[0].AverageBandwidth == 800000, "master average bandwidth is preserved");
+            AssertEqual(
+                "https://media.example.com/master/media/video.m3u8",
+                variants[0].Url,
+                "master variant URL is resolved");
+
+            SizeProbeResult metadataEstimate = M3u8SizeProbe.EstimateFromPlaylistMetadata(
+                inspection.TotalDurationSeconds,
+                variants[0].AverageBandwidth,
+                inspection.SegmentCount);
+            AssertTrue(metadataEstimate != null, "playlist metadata size estimate is created");
+            AssertTrue(metadataEstimate.Status == SizeProbeStatus.Estimated, "metadata size is marked estimated");
+            AssertTrue(metadataEstimate.FromPlaylistMetadata, "metadata estimate source is retained");
+            AssertTrue(metadataEstimate.TotalBytes == 950000, "bandwidth and duration produce expected bytes");
+
+            CaptureCandidate masterCandidate = new CaptureCandidate();
+            masterCandidate.Url = "https://media.example.com/master/index.m3u8";
+            masterCandidate.PlaylistBaseUrl = masterCandidate.Url;
+            masterCandidate.PlaylistContent = masterPlaylist;
+            masterCandidate.Inspection = HlsPlaylistInspector.Inspect(
+                masterPlaylist,
+                masterCandidate.Url);
+            CaptureCandidate mediaCandidate = new CaptureCandidate();
+            mediaCandidate.Url = variants[0].Url;
+            mediaCandidate.PlaylistBaseUrl = mediaCandidate.Url;
+            mediaCandidate.PlaylistContent = relativePlaylist;
+            mediaCandidate.Inspection = HlsPlaylistInspector.Inspect(
+                relativePlaylist,
+                mediaCandidate.Url);
+            Dictionary<string, CaptureCandidate> capturedCandidates =
+                new Dictionary<string, CaptureCandidate>(StringComparer.OrdinalIgnoreCase);
+            capturedCandidates[masterCandidate.Url] = masterCandidate;
+            capturedCandidates[mediaCandidate.Url] = mediaCandidate;
+            CaptureCandidate resolvedMedia = CaptureBrowserForm.ResolveCapturedMediaCandidate(
+                capturedCandidates,
+                masterCandidate,
+                0);
+            AssertTrue(
+                ReferenceEquals(resolvedMedia, mediaCandidate),
+                "captured master resolves to the available media child");
+            string localMediaContent = HlsPlaylistInspector.MakeReferencesAbsolute(
+                resolvedMedia.PlaylistContent,
+                resolvedMedia.PlaylistBaseUrl);
+            AssertTrue(
+                !PlaylistInput.ContainsRelativeMediaReferences(localMediaContent),
+                "captured HTTP media child can be imported as a local playlist");
+
+            string blobContent = "#EXTM3U\n#EXTINF:1,\nhttps://cdn.example.com/1.ts\n";
+            string blobMessageText = BlobPlaylistMessageParser.Marker + "\n" +
+                                     "blob:https://media.example.com/capture-id\n" +
+                                     "https://media.example.com/watch\n" +
+                                     "Test Agent\n" +
+                                     Convert.ToBase64String(Encoding.UTF8.GetBytes(blobContent));
+            BlobPlaylistMessage blobMessage;
+            AssertTrue(
+                BlobPlaylistMessageParser.TryParse(blobMessageText, out blobMessage),
+                "valid browser blob playlist message is accepted");
+            AssertEqual(blobContent, blobMessage.PlaylistContent, "blob message preserves complete playlist text");
+            AssertTrue(
+                !BlobPlaylistMessageParser.TryParse("untrusted\nmessage", out blobMessage),
+                "unrelated web messages are ignored");
+
+            string blobMessageV2Text = BlobPlaylistMessageParser.MarkerV2 + "\n" +
+                                       "blob:https://media.example.com/capture-v2\n" +
+                                       "https://media.example.com/watch/current?id=7\n" +
+                                       "https://static.example.com/player/\n" +
+                                       "Test Agent V2\n" +
+                                       Convert.ToBase64String(Encoding.UTF8.GetBytes(blobContent));
+            AssertTrue(
+                BlobPlaylistMessageParser.TryParse(blobMessageV2Text, out blobMessage),
+                "version 2 browser blob message is accepted");
+            AssertEqual(
+                "https://media.example.com/watch/current?id=7",
+                blobMessage.PageUrl,
+                "blob message preserves the exact page URL for Referer");
+            AssertEqual(
+                "https://static.example.com/player/",
+                blobMessage.BaseUrl,
+                "blob message keeps the resource base URL separate from Referer");
+
+            MediaRequestHeaders capturedHeaders = new MediaRequestHeaders();
+            capturedHeaders.Referer = "https://media.example.com/watch";
+            capturedHeaders.Origin = "https://media.example.com";
+            capturedHeaders.Authorization = "Bearer test-token";
+            capturedHeaders.SourceUrl = "https://media.example.com:443/video/segment0.ts";
+            AssertTrue(
+                capturedHeaders.TrySetAdditionalHeader("X-Playback-Token", "token:abc&123"),
+                "safe custom playback header is retained");
+            AssertTrue(
+                capturedHeaders.TrySetAdditionalHeader("Accept", "*/*"),
+                "Accept header is retained for replay");
+            AssertTrue(
+                !capturedHeaders.TrySetAdditionalHeader("Range", "bytes=0-99"),
+                "per-request Range header is not retained globally");
+            AssertTrue(
+                !capturedHeaders.TrySetAdditionalHeader("X-Bad", "line1\r\nInjected: true"),
+                "newline-containing custom header is rejected");
+            MediaRequestHeaders clonedHeaders = capturedHeaders.Clone();
+            AssertEqual(capturedHeaders.Origin, clonedHeaders.Origin, "captured Origin header is cloned");
+            AssertEqual(
+                capturedHeaders.Authorization,
+                clonedHeaders.Authorization,
+                "captured Authorization header is cloned");
+            AssertEqual(
+                capturedHeaders.SourceUrl,
+                clonedHeaders.SourceUrl,
+                "captured header source URL is cloned");
+            AssertEqual(
+                "token:abc&123",
+                clonedHeaders.AdditionalHeaders["x-playback-token"],
+                "custom headers are cloned case-insensitively");
+            clonedHeaders.TrySetAdditionalHeader("X-Playback-Token", "changed");
+            AssertEqual(
+                "token:abc&123",
+                capturedHeaders.AdditionalHeaders["X-Playback-Token"],
+                "custom header clone is independent");
+            AssertTrue(
+                MediaRequestHeaders.AreSameOrigin(
+                    "https://MEDIA.example.com/path",
+                    "https://media.example.com:443/other"),
+                "same-origin check normalizes host and default HTTPS port");
+            AssertTrue(
+                !MediaRequestHeaders.AreSameOrigin(
+                    "https://media.example.com/path",
+                    "http://media.example.com/path"),
+                "HTTPS to HTTP is never treated as same-origin");
+
+            MediaRequestHeaders sensitiveHeaders = capturedHeaders.Clone();
+            sensitiveHeaders.Cookie = "session=private";
+            sensitiveHeaders.UserAgent = "Browser Agent";
+            MediaRequestHeaders sameOriginProjection = sensitiveHeaders.CreateSafeProjection(
+                "https://media.example.com/video/segment1.ts");
+            AssertEqual(
+                "session=private",
+                sameOriginProjection.Cookie,
+                "same-origin requests retain captured cookies");
+            AssertEqual(
+                "Bearer test-token",
+                sameOriginProjection.Authorization,
+                "same-origin requests retain captured authorization");
+            AssertEqual(
+                "token:abc&123",
+                sameOriginProjection.AdditionalHeaders["X-Playback-Token"],
+                "same-origin requests retain custom playback headers");
+
+            MediaRequestHeaders crossOriginProjection = sensitiveHeaders.CreateSafeProjection(
+                "https://other.example.com/video/segment1.ts");
+            AssertTrue(
+                string.IsNullOrEmpty(crossOriginProjection.Referer) &&
+                string.IsNullOrEmpty(crossOriginProjection.Origin) &&
+                string.IsNullOrEmpty(crossOriginProjection.Cookie) &&
+                string.IsNullOrEmpty(crossOriginProjection.Authorization) &&
+                crossOriginProjection.AdditionalHeaders.Count == 0,
+                "cross-origin requests strip every captured credential-bearing header");
+            AssertEqual(
+                "Browser Agent",
+                crossOriginProjection.UserAgent,
+                "cross-origin requests retain only the user agent");
+            AssertTrue(
+                sensitiveHeaders.CreateSafeProjection("https://media.example.com:444/video.ts")
+                    .AdditionalHeaders.Count == 0,
+                "a different port is treated as cross-origin");
+
+            MediaRequestHeaders unknownSourceHeaders = sensitiveHeaders.Clone();
+            unknownSourceHeaders.SourceUrl = null;
+            MediaRequestHeaders unknownSourceProjection = unknownSourceHeaders.CreateSafeProjection(
+                "https://media.example.com/video.ts");
+            AssertTrue(
+                string.IsNullOrEmpty(unknownSourceProjection.Cookie) &&
+                unknownSourceProjection.AdditionalHeaders.Count == 0,
+                "missing source origin fails closed for captured credentials");
+
+            System.Net.HttpWebRequest sameOriginRequest = M3u8SizeProbe.CreateRequest(
+                new Uri("https://media.example.com/redirected.m3u8"),
+                "GET",
+                sensitiveHeaders,
+                false);
+            try
+            {
+                AssertTrue(!sameOriginRequest.AllowAutoRedirect, "size probes handle redirects manually");
+                AssertEqual(
+                    "session=private",
+                    sameOriginRequest.Headers[System.Net.HttpRequestHeader.Cookie],
+                    "same-origin probe request receives captured cookies");
+            }
+            finally
+            {
+                sameOriginRequest.Abort();
+            }
+
+            System.Net.HttpWebRequest crossOriginRequest = M3u8SizeProbe.CreateRequest(
+                new Uri("https://redirect.example.net/playlist.m3u8"),
+                "GET",
+                sensitiveHeaders,
+                false);
+            try
+            {
+                AssertTrue(!crossOriginRequest.AllowAutoRedirect, "cross-origin probes cannot auto-forward headers");
+                AssertTrue(
+                    string.IsNullOrEmpty(crossOriginRequest.Referer) &&
+                    string.IsNullOrEmpty(crossOriginRequest.Headers[System.Net.HttpRequestHeader.Cookie]) &&
+                    string.IsNullOrEmpty(crossOriginRequest.Headers[System.Net.HttpRequestHeader.Authorization]) &&
+                    string.IsNullOrEmpty(crossOriginRequest.Headers["Origin"]) &&
+                    string.IsNullOrEmpty(crossOriginRequest.Headers["X-Playback-Token"]),
+                    "cross-origin probe requests contain no captured credentials");
+            }
+            finally
+            {
+                crossOriginRequest.Abort();
+            }
+
+            string hostilePlayerUrl = "https://media.example.com/video.m3u8?name=\"quoted\"&x=1";
+            MediaRequestHeaders hostilePlayerHeaders = new MediaRequestHeaders();
+            hostilePlayerHeaders.Referer = "https://media.example.com/watch/\"episode\"";
+            hostilePlayerHeaders.UserAgent = "Agent \"Quoted\"";
+            hostilePlayerHeaders.Cookie = "private=must-not-enter-command-line";
+            string mpvArguments = LocalPlayer.BuildPlayerArguments(
+                "C:\\Program Files\\mpv\\mpv.exe",
+                hostilePlayerUrl,
+                hostilePlayerHeaders);
+            AssertTrue(
+                mpvArguments.IndexOf("private=must-not-enter-command-line", StringComparison.Ordinal) < 0,
+                "external player command lines never expose captured cookies");
+            AssertEqual(
+                CommandLine.JoinArguments(new[]
+                {
+                    hostilePlayerUrl,
+                    "--referrer=" + hostilePlayerHeaders.Referer,
+                    "--user-agent=" + hostilePlayerHeaders.UserAgent
+                }),
+                mpvArguments,
+                "external player arguments use the shared Windows quoting implementation");
+
+            MediaRequestHeaders crossOriginTarget = new MediaRequestHeaders();
+            crossOriginTarget.SourceUrl = "https://cdn-a.example.com/segment.ts";
+            MediaRequestHeaders crossOriginSource = new MediaRequestHeaders();
+            crossOriginSource.SourceUrl = "https://cdn-b.example.com/playlist.m3u8";
+            crossOriginSource.Cookie = "private=cookie";
+            crossOriginSource.TrySetAdditionalHeader("X-Token", "private-token");
+            CaptureBrowserForm.MergeHeaders(crossOriginTarget, crossOriginSource, false);
+            AssertTrue(
+                string.IsNullOrEmpty(crossOriginTarget.Cookie) &&
+                crossOriginTarget.AdditionalHeaders.Count == 0,
+                "fill-only merge does not copy sensitive headers across origins");
+
+            MediaRequestHeaders playlistHeaders = new MediaRequestHeaders();
+            playlistHeaders.Referer = "https://media.example.com/old";
+            playlistHeaders.TrySetAdditionalHeader("X-Token", "old");
+            MediaRequestHeaders segmentHeaders = new MediaRequestHeaders();
+            segmentHeaders.Referer = "https://media.example.com/current";
+            segmentHeaders.UserAgent = "Browser Agent";
+            segmentHeaders.TrySetAdditionalHeader("X-Token", "new");
+            CaptureBrowserForm.MergeHeaders(playlistHeaders, segmentHeaders, false);
+            AssertEqual(
+                "https://media.example.com/old",
+                playlistHeaders.Referer,
+                "playlist-to-playlist merge preserves existing Referer");
+            CaptureBrowserForm.MergeHeaders(playlistHeaders, segmentHeaders, true);
+            AssertEqual(
+                "https://media.example.com/current",
+                playlistHeaders.Referer,
+                "real segment headers override stale playlist Referer");
+            AssertEqual(
+                "new",
+                playlistHeaders.AdditionalHeaders["X-Token"],
+                "real segment custom token overrides playlist value");
+
+            List<string> headerArguments = new List<string>();
+            MainForm.AppendCapturedHeaderArguments(headerArguments, capturedHeaders);
+            AssertTrue(
+                CountValue(headerArguments, "-H") == 5,
+                "each captured fixed or custom header gets its own -H argument");
+            AssertTrue(
+                headerArguments.Contains("X-Playback-Token: token:abc&123"),
+                "custom playback token is forwarded without URL encoding");
+            AssertTrue(
+                !headerArguments.Contains("Range: bytes=0-99"),
+                "blocked Range header is absent from downloader arguments");
+            List<string> curlTransportArguments = new List<string>();
+            MainForm.AppendCurlTransportDownloaderArguments(curlTransportArguments);
+            AssertTrue(
+                ContainsArgumentPair(curlTransportArguments, "--use-system-proxy", "false"),
+                "curl transport prevents localhost requests from using the system proxy");
+            AssertTrue(
+                ContainsArgumentPair(curlTransportArguments, "--thread-count", "4"),
+                "curl transport limits upstream connection pressure");
+            AssertTrue(
+                ContainsArgumentPair(curlTransportArguments, "--download-retry-count", "10"),
+                "curl transport gives transient segments additional downloader retries");
+            AssertTrue(
+                ContainsArgumentPair(curlTransportArguments, "--http-request-timeout", "660"),
+                "downloader waits longer than the bounded upstream retry window");
+            AssertTrue(
+                MainForm.RequiresCapturedHeaderIsolation(capturedHeaders),
+                "captured credentials force per-resource curl header isolation");
+            MediaRequestHeaders userAgentOnlyHeaders = new MediaRequestHeaders();
+            userAgentOnlyHeaders.UserAgent = "Browser Agent";
+            AssertTrue(
+                !MainForm.RequiresCapturedHeaderIsolation(userAgentOnlyHeaders),
+                "a user agent alone does not force credential isolation");
+            AssertTrue(
+                CurlMediaProxy.ShouldLogRepeatedEvent(1, 25) &&
+                CurlMediaProxy.ShouldLogRepeatedEvent(25, 25) &&
+                !CurlMediaProxy.ShouldLogRepeatedEvent(2, 25),
+                "recoverable proxy warnings log only the first and periodic counts");
+            string redirectedMediaUrl;
+            AssertTrue(
+                CurlMediaProxy.TryResolveUpstreamRedirect(
+                    302,
+                    "https://media.example.com/path/segment.ts",
+                    "../objects/segment.ts?token=next",
+                    out redirectedMediaUrl) &&
+                redirectedMediaUrl == "https://media.example.com/objects/segment.ts?token=next",
+                "curl proxy resolves relative media redirects with a bounded manual hop");
+            AssertTrue(
+                CurlMediaProxy.TryResolveUpstreamRedirect(
+                    307,
+                    "https://media.example.com/segment.ts",
+                    "https://objects.example.net/file.ts",
+                    out redirectedMediaUrl) &&
+                redirectedMediaUrl == "https://objects.example.net/file.ts",
+                "curl proxy permits HTTP cross-origin redirects for header reprojection");
+            AssertTrue(
+                !CurlMediaProxy.TryResolveUpstreamRedirect(
+                    302,
+                    "https://media.example.com/segment.ts",
+                    "file:///C:/private.txt",
+                    out redirectedMediaUrl) &&
+                !CurlMediaProxy.TryResolveUpstreamRedirect(
+                    304,
+                    "https://media.example.com/segment.ts",
+                    "https://objects.example.net/file.ts",
+                    out redirectedMediaUrl),
+                "curl proxy rejects non-HTTP and non-redirect targets");
+            AssertEqual(
+                "https://media.example.com/watch/path",
+                MainForm.DescribeRefererForLog(
+                    "https://media.example.com/watch/path?token=secret#part"),
+                "Referer diagnostics hide query and fragment values");
+
+            AssertEqual(
+                "https://example.com/Media/seg.jpeg?Token=AbC",
+                CaptureBrowserForm.NormalizeResourceUrl(
+                    "https://EXAMPLE.com:443/Media/seg.jpeg?Token=AbC#ignored",
+                    true),
+                "exact resource key normalizes host and keeps path/query case");
+            AssertEqual(
+                "https://example.com/Media/seg.jpeg",
+                CaptureBrowserForm.NormalizeResourceUrl(
+                    "https://EXAMPLE.com:443/Media/seg.jpeg?Token=AbC#ignored",
+                    false),
+                "path resource key removes only query and fragment");
+            AssertEqual(
+                "获取 KEY 失败：403 Forbidden",
+                MainForm.ExtractDownloaderFailureSummary(
+                    "03:20:01.123 ERROR : 获取 KEY 失败：403 Forbidden",
+                    false),
+                "downloader ERROR becomes a concise failure summary");
+            AssertEqual(
+                "Response status code does not indicate success: 403 (Forbidden). (10/10)",
+                MainForm.ExtractDownloaderFailureSummary(
+                    "03:20:02.456 WARN : Response status code does not indicate success: 403 (Forbidden). (10/10)",
+                    true),
+                "downloader WARN is retained as a fallback summary");
+            AssertTrue(
+                MainForm.ExtractDownloaderFailureSummary(
+                    "03:20:03.789 INFO : 加载URL: local.m3u8",
+                    true) == null,
+                "downloader INFO is not reported as the failure cause");
+
             AssertTrue(HlsKeyValue.IsRecognized("00112233445566778899aabbccddeeff"), "32-character HLS hex key");
             AssertTrue(HlsKeyValue.IsRecognized("ABEiM0RVZneImaq7zN3u/w=="), "16-byte HLS Base64 key");
             AssertTrue(!HlsKeyValue.IsRecognized("not-a-valid-key"), "invalid HLS key is rejected by validation");
@@ -151,6 +617,7 @@ namespace M3u8DownloaderGui
             TestToolLocator();
             TestDependencyInstaller();
             TestDownloadTemporaryStore();
+            DownloadResumeStoreSelfTests.Run(AssertTrue);
             TestConversionFileStore();
 
             Console.WriteLine(_failed == 0 ? "ALL TESTS PASSED" : (_failed + " TEST(S) FAILED"));
@@ -720,6 +1187,37 @@ namespace M3u8DownloaderGui
                 {
                 }
             }
+        }
+
+        private static int CountValue(IEnumerable<string> values, string expected)
+        {
+            int count = 0;
+            foreach (string value in values)
+            {
+                if (string.Equals(value, expected, StringComparison.Ordinal))
+                {
+                    count++;
+                }
+            }
+
+            return count;
+        }
+
+        private static bool ContainsArgumentPair(
+            IList<string> arguments,
+            string name,
+            string value)
+        {
+            for (int index = 0; index + 1 < arguments.Count; index++)
+            {
+                if (string.Equals(arguments[index], name, StringComparison.Ordinal) &&
+                    string.Equals(arguments[index + 1], value, StringComparison.Ordinal))
+                {
+                    return true;
+                }
+            }
+
+            return false;
         }
 
         private static void AssertEqual(string expected, string actual, string testName)

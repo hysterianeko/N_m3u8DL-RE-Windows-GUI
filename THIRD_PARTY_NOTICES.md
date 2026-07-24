@@ -1,9 +1,26 @@
 # Third-party notices
 
-This project is an independent graphical wrapper. It starts the following
+This project is an independent graphical wrapper. It redistributes the
+Microsoft Edge WebView2 SDK files described below and can start the listed
 third-party command-line programs as external processes. Their source code,
 copyright, trademarks, releases, and licenses remain with their respective
 upstream projects.
+
+## Microsoft Edge WebView2 SDK
+
+- Package: `Microsoft.Web.WebView2`
+- Version: `1.0.2957.106`
+- Project: https://aka.ms/webview
+- NuGet package: https://www.nuget.org/packages/Microsoft.Web.WebView2/1.0.2957.106
+- Included license: [LICENSE.WebView2](LICENSE.WebView2)
+- Included third-party notice: [NOTICE.WebView2](NOTICE.WebView2)
+
+The Windows x64 release ZIP redistributes the unmodified .NET Framework 4.6.2
+Core and WinForms assemblies and the x64 native WebView2 loader from the
+official package. The build script downloads that pinned package only when the
+local SDK files are absent or invalid, verifies its SHA-256 digest, extracts the
+three required files, and verifies each extracted file before use. The package
+does not bundle the Microsoft Edge WebView2 Runtime itself.
 
 ## N_m3u8DL-RE
 

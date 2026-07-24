@@ -22,6 +22,7 @@ namespace M3u8DownloaderGui
         public string FfmpegPath;
         public bool MuxToMp4 = true;
         public bool OpenFolderWhenDone;
+        public string LastCaptureUrl;
     }
 
     internal static class SettingsStore
@@ -59,6 +60,7 @@ namespace M3u8DownloaderGui
                     root,
                     "openFolderWhenDone",
                     settings.OpenFolderWhenDone);
+                settings.LastCaptureUrl = ReadElement(root, "lastCaptureUrl", settings.LastCaptureUrl);
             }
             catch
             {
@@ -95,9 +97,9 @@ namespace M3u8DownloaderGui
                     writer.WriteElementString("downloaderPath", settings.DownloaderPath ?? string.Empty);
                     writer.WriteElementString("ffmpegPath", settings.FfmpegPath ?? string.Empty);
                     writer.WriteElementString("muxToMp4", settings.MuxToMp4 ? "true" : "false");
-                    writer.WriteElementString(
-                        "openFolderWhenDone",
+                    writer.WriteElementString("openFolderWhenDone",
                         settings.OpenFolderWhenDone ? "true" : "false");
+                    writer.WriteElementString("lastCaptureUrl", settings.LastCaptureUrl ?? string.Empty);
                     writer.WriteEndElement();
                     writer.WriteEndDocument();
                 }

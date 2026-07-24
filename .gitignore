@@ -4,6 +4,10 @@ bin/
 obj/
 dist/
 tools/
+.webview2-restore-*/
+.webview2-backup-*/
+.webview2-backup/
+.webview2-failed-*/
 *.exe
 *.dll
 *.pdb

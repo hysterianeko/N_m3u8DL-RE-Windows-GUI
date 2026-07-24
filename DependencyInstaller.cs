@@ -717,7 +717,7 @@ namespace M3u8DownloaderGui
             HttpWebRequest request = (HttpWebRequest)WebRequest.Create(uri);
             request.Method = "GET";
             request.AllowAutoRedirect = true;
-            request.UserAgent = "M3U8-Video-Downloader/1.2.3";
+            request.UserAgent = "M3U8-Video-Downloader/1.4.0";
             request.Timeout = 30000;
             request.ReadWriteTimeout = 60000;
             request.KeepAlive = true;
